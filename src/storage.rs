@@ -1,4 +1,4 @@
-use crate::error::{self, AppError};
+use crate::error::{self, AppError, MPVDecode};
 use foundationdb::{
     options::MutationType,
     tuple::{Subspace, Versionstamp},
@@ -11,6 +11,12 @@ pub(crate) struct DocID([u8; 12]);
 
 pub(crate) struct DB {
     fdb: foundationdb::Database,
+}
+
+impl DocID {
+    fn as_slice_ref(&self) -> &[u8] {
+        &self.0.as_slice()
+    }
 }
 
 impl Into<Box<str>> for DocID {
@@ -105,8 +111,36 @@ impl DB {
         db: &str,
         collection: &str,
         id: impl TryInto<DocID, Error = AppError>,
-    ) -> Result<rmpv::Value, AppError> {
+    ) -> Result<Option<rmpv::Value>, AppError> {
         let id = id.try_into()?;
-        todo!()
+        let subspace = Subspace::all().subspace(&(db, collection));
+        let key = subspace.pack(&(PK, id.as_slice_ref()));
+        eprintln!("getting key {:}", dump_key(&key));
+        let tx = self.fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+
+        match tx.get(&key, false).await.context(error::Fdb {
+            e: "reading the document",
+        })? {
+            Some(data) => Ok(Some(rmpv::decode::read_value(&mut data.as_ref()).context(
+                MPVDecode {
+                    e: "decoding document",
+                },
+            )?)),
+            None => Ok(None),
+        }
     }
+}
+
+fn dump_key(key: &[u8]) -> String {
+    let mut r = String::new();
+    for b in key {
+        if b.is_ascii_alphanumeric() {
+            r.push(*b as char);
+        } else {
+            r.push_str(&format!("\\{b:02x}"));
+        }
+    }
+    r
 }

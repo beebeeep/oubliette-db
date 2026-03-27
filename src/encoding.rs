@@ -1,3 +1,5 @@
+use base64::prelude::*;
+
 pub(crate) fn json2mp(v: serde_json::Value) -> rmpv::Value {
     match v {
         serde_json::Value::Null => rmpv::Value::Nil,
@@ -25,17 +27,35 @@ pub(crate) fn mp2json(v: rmpv::Value) -> serde_json::Value {
         rmpv::Value::String(s) => {
             serde_json::Value::String(s.into_str().unwrap_or(String::from("")))
         }
-        rmpv::Value::Binary(items) => todo!(),
-        rmpv::Value::Array(values) => todo!(),
-        rmpv::Value::Map(items) => todo!(),
+        rmpv::Value::Binary(items) => serde_json::Value::String(BASE64_STANDARD.encode(items)),
+        rmpv::Value::Array(values) => {
+            serde_json::Value::Array(values.into_iter().map(|e| mp2json(e)).collect())
+        }
+        rmpv::Value::Map(items) => mpMap2json(items),
         rmpv::Value::Ext(_, items) => serde_json::Value::Null, // not supported
     }
 }
 
-fn jString2mp(s: &str) -> rmpv::Value {
-    rmpv::Value::String(rmpv::Utf8String::from(s));
-    todo!()
+fn mpMap2json(items: Vec<(rmpv::Value, rmpv::Value)>) -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::from_iter(
+        items.into_iter().filter(|(k, _)| k.is_str()).map(|(k, v)| {
+            (
+                if let rmpv::Value::String(k) = k {
+                    k.into_str().unwrap_or(String::from(""))
+                } else {
+                    String::from("")
+                },
+                mp2json(v),
+            )
+        }),
+    ))
 }
+
+fn jString2mp(s: String) -> rmpv::Value {
+    // TODO: some sort of base64 encoded binary data support?
+    rmpv::Value::String(rmpv::Utf8String::from(s))
+}
+
 fn jNumber2mp(v: serde_json::Number) -> rmpv::Value {
     if let Some(n) = v.as_i64() {
         rmpv::Value::from(n)
@@ -49,5 +69,13 @@ fn jNumber2mp(v: serde_json::Number) -> rmpv::Value {
 }
 
 fn mpInt2json(v: rmpv::Integer) -> serde_json::Value {
-    todo!()
+    if let Some(n) = v.as_i64() {
+        serde_json::Value::from(n)
+    } else if let Some(n) = v.as_u64() {
+        serde_json::Value::from(n)
+    } else if let Some(n) = v.as_f64() {
+        serde_json::Value::from(n)
+    } else {
+        serde_json::Value::from(0)
+    }
 }

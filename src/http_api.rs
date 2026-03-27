@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    encoding::{json2mp, mp2json},
     error::{self, AppError},
     storage,
 };
@@ -57,14 +58,22 @@ pub async fn fdb_get(
 
 pub(crate) async fn collection_query(
     State(state): State<Arc<AppState>>,
-    Path(db): Path<String>,
-    Path(collection): Path<String>,
+    Path((db, collection)): Path<(String, String)>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
     if let Some(doc_id) = req.doc_id {
-        let result = state.db.get_doc(&db, &collection, doc_id.as_ref()).await?;
-
-        todo!()
+        match state.db.get_doc(&db, &collection, doc_id.as_ref()).await? {
+            Some(r) => {
+                return Ok(Json(QueryResponse {
+                    results: vec![mp2json(r)],
+                }));
+            }
+            None => {
+                return Ok(Json(QueryResponse {
+                    results: Vec::new(),
+                }));
+            }
+        }
     } else {
         return error::BadRequest {
             e: "specify doc_id",
@@ -78,18 +87,10 @@ pub(crate) async fn collection_set(
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<SetRequest>,
 ) -> Result<Json<SetResponse>, AppError> {
-    // transcode json value to messagepack and parse it back to messagepack value
-    // TODO: implement transcoding between json and mp values directly
-    let buf = Vec::with_capacity(64);
-    let mut tc = rmp_serde::Serializer::new(buf);
-    serde_transcode::transcode(req.doc, &mut tc).context(error::MPEncode {
-        e: "encoding document",
-    })?;
-    let doc_value =
-        rmpv::decode::read_value(&mut tc.into_inner().as_slice()).context(error::MPVDecode {
-            e: "decoding document",
-        })?;
-    let id = state.db.insert_doc(&db, &collection, doc_value).await?;
+    let id = state
+        .db
+        .insert_doc(&db, &collection, json2mp(req.doc))
+        .await?;
 
     Ok(Json(SetResponse { id: id.into() }))
 }
