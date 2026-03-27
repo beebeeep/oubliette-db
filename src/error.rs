@@ -50,6 +50,12 @@ pub enum AppError {
     #[snafu(display("request error: {e}"), context(suffix(false)))]
     BadRequest { e: String },
 
+    #[snafu(display("failed to parse query: {e}"), context(suffix(false)))]
+    QueryParse {
+        e: String,
+        source: sexpression::ParseError,
+    },
+
     #[snafu(whatever, display("{message}"))]
     Generic {
         message: String,
@@ -108,6 +114,11 @@ impl IntoResponse for AppError {
             AppError::BadRequest { e } => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("{e}")})),
+            )
+                .into_response(),
+            AppError::QueryParse { e, source } => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{e}: {source}")})),
             )
                 .into_response(),
         }

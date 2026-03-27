@@ -8,6 +8,7 @@ use snafu::prelude::*;
 mod encoding;
 mod error;
 mod http_api;
+mod predicate;
 mod storage;
 
 #[tokio::main]

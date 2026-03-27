@@ -79,6 +79,8 @@ impl DB {
         collection: &str,
         doc: rmpv::Value,
     ) -> Result<DocID, AppError> {
+        Self::validate_doc(&doc)?;
+
         let subspace = Subspace::all().subspace(&(db, collection));
         let kt = (PK, &Versionstamp::incomplete(0));
         let key = subspace.pack_with_versionstamp(&kt);
@@ -106,6 +108,7 @@ impl DB {
         Ok(DocID(versionstamp.as_bytes().clone()))
     }
 
+    /// queries single doc by id
     pub(crate) async fn get_doc(
         &self,
         db: &str,
@@ -114,8 +117,7 @@ impl DB {
     ) -> Result<Option<rmpv::Value>, AppError> {
         let id = id.try_into()?;
         let subspace = Subspace::all().subspace(&(db, collection));
-        let key = subspace.pack(&(PK, id.as_slice_ref()));
-        eprintln!("getting key {:}", dump_key(&key));
+        let key = subspace.pack(&(PK, Versionstamp::from(id.0)));
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
@@ -129,6 +131,26 @@ impl DB {
                 },
             )?)),
             None => Ok(None),
+        }
+    }
+
+    fn validate_doc(doc: &rmpv::Value) -> Result<(), AppError> {
+        if let rmpv::Value::Map(v) = doc {
+            for (k, _) in v {
+                if let rmpv::Value::String(_) = k {
+                    continue;
+                }
+                return error::BadRequest {
+                    e: "field name must be string",
+                }
+                .fail();
+            }
+            Ok(())
+        } else {
+            error::BadRequest {
+                e: "document must be an object",
+            }
+            .fail()
         }
     }
 }

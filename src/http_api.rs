@@ -30,6 +30,7 @@ pub struct UpdateResponse {}
 pub struct SetRequest {
     doc: serde_json::Value,
 }
+
 #[derive(Serialize)]
 pub struct SetResponse {
     id: Box<str>,
