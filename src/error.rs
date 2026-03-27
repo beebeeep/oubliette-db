@@ -20,6 +20,36 @@ pub enum AppError {
         source: foundationdb::TransactionCommitError,
     },
 
+    #[snafu(display("MessagePack encode error"), context(suffix(false)))]
+    MPVEncode {
+        e: String,
+        source: rmpv::encode::Error,
+    },
+
+    #[snafu(display("MessagePack decode error"), context(suffix(false)))]
+    MPVDecode {
+        e: String,
+        source: rmpv::decode::Error,
+    },
+
+    #[snafu(display("MessagePack encode error"), context(suffix(false)))]
+    MPEncode {
+        e: String,
+        source: rmp_serde::encode::Error,
+    },
+
+    #[snafu(display("MessagePack decode error"), context(suffix(false)))]
+    MPDecode {
+        e: String,
+        source: rmp_serde::decode::Error,
+    },
+
+    #[snafu(display("docID decoding error"), context(suffix(false)))]
+    DocIDDecode { source: hex::FromHexError },
+
+    #[snafu(display("request error: {e}"), context(suffix(false)))]
+    BadRequest { e: String },
+
     #[snafu(whatever, display("{message}"))]
     Generic {
         message: String,
@@ -48,6 +78,36 @@ impl IntoResponse for AppError {
                         Some(e) => format!("{message}: {e}"),
                         None =>    format!("{message}"),
                 }})),
+            )
+                .into_response(),
+            AppError::MPVEncode { e, source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}: {source}")})),
+            )
+                .into_response(),
+            AppError::MPVDecode { e, source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}: {source}")})),
+            )
+                .into_response(),
+            AppError::MPEncode { e, source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}: {source}")})),
+            )
+                .into_response(),
+            AppError::MPDecode { e, source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{e}: {source}")})),
+            )
+                .into_response(),
+            AppError::DocIDDecode { source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("{source}")})),
+            )
+                .into_response(),
+            AppError::BadRequest { e } => (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!("{e}")})),
             )
                 .into_response(),
         }

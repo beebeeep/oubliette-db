@@ -7,6 +7,7 @@ edition = "2024"
 axum = { version = "0.8.8", features = ["http2"] }
 foundationdb = { version = "0.10.0", features = ["fdb-7_3"] }
 futures = "0.3.32"
+hex = "0.4.3"
 rmp-serde = "1.3.1"
 rmpv = "1.3.1"
 serde = { version = "1.0.228", features = ["derive"] }
