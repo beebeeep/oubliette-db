@@ -25,7 +25,8 @@ impl<'a> Predicate<'a> {
     }
 
     pub(crate) fn execute(&self, value: &rmpv::Value) -> Result<bool, AppError> {
-        Val::new(value, Some(&self.expression))?.evaluate()
+        let data = self.get_referred_fields(value);
+        Val::new(&data, Some(&self.expression))?.evaluate()
     }
 
     fn extract_referred_fields(&mut self) {
@@ -47,44 +48,51 @@ impl<'a> Predicate<'a> {
         }
     }
 
-    fn get_referred_fields(&mut self, value: &rmpv::Value) -> HashMap<&str, rmpv::Value> {
+    fn get_referred_fields(&self, value: &'a rmpv::Value) -> HashMap<&str, &rmpv::Value> {
         let mut r = HashMap::new();
         'NEXT_FIELD: for path in &self.referred_fields {
-            let v = value;
+            // path looks like .foo.bar.baz, split it by ".", skip 1st part
+            // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
+            // note that document may not contain fields referred by query, that is normal
+            let mut tail = value;
             for field in path.split(".").skip(1) {
-                if let rmpv::Value::Map(items) = v {
-                    for (k, v) in items {
-                        let k = if let Some(s) = k.as_str() {
-                            s
-                        } else {
-                            continue 'NEXT_FIELD;
-                        };
-                        if k != field {
-                            continue 'NEXT_FIELD;
-                        }
-                        todo!()
-                    }
+                if let Some(v) = Self::get_field(field, tail) {
+                    tail = v;
                 } else {
                     continue 'NEXT_FIELD;
                 }
             }
+            r.insert(*path, tail);
         }
         r
+    }
+
+    fn get_field(name: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
+        if let rmpv::Value::Map(items) = value {
+            for (k, v) in items {
+                if let Some(s) = k.as_str() {
+                    if s == name {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
     }
 }
 
 struct Val<'a> {
-    doc: &'a rmpv::Value,
+    values: &'a HashMap<&'a str, &'a rmpv::Value>,
     expr: &'a sexpression::Expression<'a>,
 }
 
 impl<'a> Val<'a> {
     fn new(
-        doc: &'a rmpv::Value,
+        values: &'a HashMap<&str, &rmpv::Value>,
         expr: Option<&'a sexpression::Expression>,
     ) -> Result<Self, AppError> {
         if let Some(expr) = expr {
-            Ok(Self { doc, expr })
+            Ok(Self { values, expr })
         } else {
             whatever!("syntax error")
         }
@@ -92,13 +100,6 @@ impl<'a> Val<'a> {
 }
 
 impl<'a> Val<'a> {
-    fn get_from_doc(&self, path: &str) -> Option<&'a Expression<'a>> {
-        if !path.starts_with(".") {
-            return None;
-        }
-        Some(&Expression::Number(137.0))
-    }
-
     fn evaluate(&self) -> Result<bool, AppError> {
         let r = match self.expr {
             Expression::Number(_) => true,
@@ -121,23 +122,35 @@ impl<'a> Val<'a> {
         match &exprs.get(0) {
             Some(Expression::Symbol(op)) => {
                 let result = match *op {
-                    "eq" => Val::new(self.doc, exprs.get(1))? == Val::new(self.doc, exprs.get(2))?,
+                    "eq" => {
+                        Val::new(self.values, exprs.get(1))? == Val::new(self.values, exprs.get(2))?
+                    }
                     "in" => {
                         // (in .foo (1 2 3 4))
                         if exprs.len() < 3 {
                             whatever!("syntax error");
                         }
                         for v in &exprs[2..] {
-                            if Val::new(self.doc, exprs.get(1))? == Val::new(self.doc, Some(v))? {
+                            if Val::new(self.values, exprs.get(1))?
+                                == Val::new(self.values, Some(v))?
+                            {
                                 return Ok(true);
                             }
                         }
                         false
                     }
-                    "ge" => Val::new(self.doc, exprs.get(1))? >= Val::new(self.doc, exprs.get(2))?,
-                    "gt" => Val::new(self.doc, exprs.get(1))? > Val::new(self.doc, exprs.get(2))?,
-                    "le" => Val::new(self.doc, exprs.get(1))? <= Val::new(self.doc, exprs.get(2))?,
-                    "lt" => Val::new(self.doc, exprs.get(1))? < Val::new(self.doc, exprs.get(2))?,
+                    "ge" => {
+                        Val::new(self.values, exprs.get(1))? >= Val::new(self.values, exprs.get(2))?
+                    }
+                    "gt" => {
+                        Val::new(self.values, exprs.get(1))? > Val::new(self.values, exprs.get(2))?
+                    }
+                    "le" => {
+                        Val::new(self.values, exprs.get(1))? <= Val::new(self.values, exprs.get(2))?
+                    }
+                    "lt" => {
+                        Val::new(self.values, exprs.get(1))? < Val::new(self.values, exprs.get(2))?
+                    }
                     "and" => {
                         // (and (eq .foo "chlos") (eq .bar 137))
                         if exprs.len() < 3 {
@@ -145,7 +158,7 @@ impl<'a> Val<'a> {
                         }
                         let mut r = true;
                         for v in &exprs[2..] {
-                            r = r && Val::new(self.doc, Some(v))?.evaluate()?;
+                            r = r && Val::new(self.values, Some(v))?.evaluate()?;
                         }
                         r
                     }
@@ -156,11 +169,11 @@ impl<'a> Val<'a> {
                         }
                         let mut r = false;
                         for v in &exprs[2..] {
-                            r = r || Val::new(self.doc, Some(v))?.evaluate()?;
+                            r = r || Val::new(self.values, Some(v))?.evaluate()?;
                         }
                         r
                     }
-                    "not" => !Val::new(self.doc, exprs.get(1))?.evaluate()?,
+                    "not" => !Val::new(self.values, exprs.get(1))?.evaluate()?,
                     s => {
                         whatever!("invalid operation '{s}'");
                     }
@@ -184,13 +197,14 @@ impl<'a> PartialEq for Val<'a> {
 
         // first, dereference values
         let a = if let Expression::Symbol(path) = self.expr {
-            if let Some(v) = self.get_from_doc(path) {
+            debug_assert!(path.starts_with("."));
+            if let Some(v) = self.values.get(path) {
                 v
             } else {
                 return false;
             }
         } else {
-            self.expr
+            &self.expr
         };
         let b = if let Expression::Symbol(path) = other.expr {
             if let Some(v) = self.get_from_doc(path) {
@@ -219,21 +233,19 @@ impl<'a> PartialOrd for Val<'a> {
 
 #[cfg(test)]
 mod tests {
-    use crate::predicate::Predicate;
+    use serde_json::json;
+
+    use crate::{encoding::json2mp, predicate::Predicate};
 
     #[test]
-    fn exprs() {
-        // let a = sexpression::read(r#"(and (eq .foo "chlos") (eq .baz 137))"#).unwrap();
-        let a = ".foo.bar.baz".split(".").skip(1);
-        for v in a {
-            println!("{v:?}");
-        }
-    }
-
-    #[test]
-    fn test_referred_fields_extraction() {
+    fn referred_fields_extraction() {
         let p = Predicate::from_query(r#"(and (eq .foo "chlos") (eq '.baz.bar' 137))"#).unwrap();
         assert!(p.referred_fields.contains(&".foo"));
         assert!(p.referred_fields.contains(&".baz.bar"));
+        let v = json2mp(json!({"foo": 123, "baz": {"bar": "chlos", "bak": true}}));
+        let fields = p.get_referred_fields(&v);
+        assert_eq!(fields.get(".foo"), Some(&&rmpv::Value::from(123)));
+        assert_eq!(fields.get(".baz.bar"), Some(&&rmpv::Value::from("chlos")));
+        assert!(!fields.contains_key(".baz.bak"));
     }
 }
