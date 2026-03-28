@@ -1,9 +1,76 @@
+use std::collections::HashMap;
+
 use crate::error::{self, AppError};
 use sexpression::Expression;
 use snafu::{ResultExt, whatever};
 
 pub(crate) struct Predicate<'a> {
+    referred_fields: Vec<&'a str>,
     expression: sexpression::Expression<'a>,
+}
+
+impl<'a> Predicate<'a> {
+    pub(crate) fn from_query(query: &'a str) -> Result<Self, AppError> {
+        let expression = sexpression::read(query).context(error::QueryParse {
+            e: "failed to parse query",
+        })?;
+
+        let mut p = Self {
+            expression,
+            referred_fields: Vec::with_capacity(2),
+        };
+        p.extract_referred_fields();
+
+        Ok(p)
+    }
+
+    pub(crate) fn execute(&self, value: &rmpv::Value) -> Result<bool, AppError> {
+        Val::new(value, Some(&self.expression))?.evaluate()
+    }
+
+    fn extract_referred_fields(&mut self) {
+        let mut expressions = vec![&self.expression];
+        while let Some(expr) = expressions.pop() {
+            match expr {
+                Expression::Symbol(sym) => {
+                    if sym.starts_with(".") {
+                        self.referred_fields.push(*sym);
+                    }
+                }
+                Expression::List(exprs) => {
+                    for expr in exprs {
+                        expressions.push(expr);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn get_referred_fields(&mut self, value: &rmpv::Value) -> HashMap<&str, rmpv::Value> {
+        let mut r = HashMap::new();
+        'NEXT_FIELD: for path in &self.referred_fields {
+            let v = value;
+            for field in path.split(".").skip(1) {
+                if let rmpv::Value::Map(items) = v {
+                    for (k, v) in items {
+                        let k = if let Some(s) = k.as_str() {
+                            s
+                        } else {
+                            continue 'NEXT_FIELD;
+                        };
+                        if k != field {
+                            continue 'NEXT_FIELD;
+                        }
+                        todo!()
+                    }
+                } else {
+                    continue 'NEXT_FIELD;
+                }
+            }
+        }
+        r
+    }
 }
 
 struct Val<'a> {
@@ -150,26 +217,23 @@ impl<'a> PartialOrd for Val<'a> {
     }
 }
 
-impl<'a> Predicate<'a> {
-    pub(crate) fn from_query(query: &'a str) -> Result<Self, AppError> {
-        let expression = sexpression::read(query).context(error::QueryParse {
-            e: "failed to parse query",
-        })?;
-
-        Ok(Self { expression })
-    }
-
-    pub(crate) fn execute(&self, value: &rmpv::Value) -> Result<bool, AppError> {
-        Val::new(value, Some(&self.expression))?.evaluate()
-    }
-}
-
 #[cfg(test)]
 mod tests {
+    use crate::predicate::Predicate;
+
     #[test]
     fn exprs() {
         // let a = sexpression::read(r#"(and (eq .foo "chlos") (eq .baz 137))"#).unwrap();
-        let a = ".foo.bar.baz".split(".");
-        println!("{a:?}");
+        let a = ".foo.bar.baz".split(".").skip(1);
+        for v in a {
+            println!("{v:?}");
+        }
+    }
+
+    #[test]
+    fn test_referred_fields_extraction() {
+        let p = Predicate::from_query(r#"(and (eq .foo "chlos") (eq '.baz.bar' 137))"#).unwrap();
+        assert!(p.referred_fields.contains(&".foo"));
+        assert!(p.referred_fields.contains(&".baz.bar"));
     }
 }
