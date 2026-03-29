@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::error::{self, AppError};
+use crate::{
+    error::{self, AppError},
+    storage::DocID,
+};
 use foundationdb::tuple::TuplePack;
 use sexpression::Expression;
 use snafu::{ResultExt, whatever};
@@ -25,8 +28,8 @@ impl<'a> Predicate<'a> {
         Ok(p)
     }
 
-    pub(crate) fn execute(&self, value: &rmpv::Value) -> Result<bool, AppError> {
-        let data = self.get_referred_fields(value);
+    pub(crate) fn execute(&self, id: &str, value: &rmpv::Value) -> Result<bool, AppError> {
+        let data = self.get_referred_fields(id, value);
         Val::new(&data, Some(&self.expression))?.evaluate()
     }
 
@@ -49,8 +52,14 @@ impl<'a> Predicate<'a> {
         }
     }
 
-    fn get_referred_fields(&self, value: &'a rmpv::Value) -> HashMap<&'a str, Expression<'a>> {
+    fn get_referred_fields(
+        &self,
+        id: &'a str,
+        value: &'a rmpv::Value,
+    ) -> HashMap<&'a str, Expression<'a>> {
         let mut r = HashMap::new();
+        r.insert(".__id", Expression::Str(id)); // always inject doc ID as a bogus field "__id"
+
         'NEXT_FIELD: for path in &self.referred_fields {
             // path looks like .foo.bar.baz, split it by ".", skip 1st part
             // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
@@ -286,10 +295,11 @@ mod tests {
         assert!(p.referred_fields.contains(&".foo"));
         assert!(p.referred_fields.contains(&".baz.bar"));
         let v = json2mp(json!({"foo": 123, "baz": {"bar": "chlos", "bak": true}}));
-        let fields = p.get_referred_fields(&v);
+        let fields = p.get_referred_fields("id", &v);
         assert_eq!(fields.get(".foo"), Some(&Expression::Number(123.0)));
         assert_eq!(fields.get(".baz.bar"), Some(&Expression::Str("chlos")));
         assert!(!fields.contains_key(".baz.bak"));
+        assert!(fields.contains_key(".__id"));
     }
 
     #[test]
@@ -298,7 +308,10 @@ mod tests {
 
         // empty query
         assert_eq!(
-            Predicate::from_query(r#"()"#).unwrap().execute(&v).unwrap(),
+            Predicate::from_query(r#"()"#)
+                .unwrap()
+                .execute("", &v)
+                .unwrap(),
             true
         );
 
@@ -306,7 +319,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"true"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -315,16 +328,34 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"false"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             false
+        );
+
+        // get by id
+        assert_eq!(
+            Predicate::from_query(r#"(eq .__id "id")"#)
+                .unwrap()
+                .execute("id", &v)
+                .unwrap(),
+            true
         );
 
         // simple comparison
         assert_eq!(
             Predicate::from_query(r#"(eq .foo "chlos")"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
+                .unwrap(),
+            true
+        );
+
+        // simple comparison
+        assert_eq!(
+            Predicate::from_query(r#"(eq .foo "chlos")"#)
+                .unwrap()
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -333,7 +364,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(ge .baz.bar 137)"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -342,7 +373,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(le .baz.bar 137)"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -351,7 +382,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(lt .baz.bar 1000)"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -363,7 +394,7 @@ mod tests {
             // so this test will fail with predicate (gt .baz.bar 0)
             Predicate::from_query(r#"(gt .baz.bar 0.0)"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -371,7 +402,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(not (ge .baz.bar 10))"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             false
         );
@@ -380,7 +411,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(ne .baz.bar 166)"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -389,7 +420,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(in .foo ("chlos" "CHLOS" "chicken))"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -398,7 +429,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(and (eq .foo "chlos") (eq .baz.bar 137))"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -407,7 +438,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(and (eq .foo "CHLOS") (eq .baz.bar 137))"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             false
         );
@@ -416,7 +447,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(or (eq .foo "chlos") (eq .baz.bar 0))"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             true
         );
@@ -425,7 +456,7 @@ mod tests {
         assert_eq!(
             Predicate::from_query(r#"(or (eq .foo "CHLOS") (eq .baz.bar 0))"#)
                 .unwrap()
-                .execute(&v)
+                .execute("", &v)
                 .unwrap(),
             false
         );

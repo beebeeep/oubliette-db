@@ -3,6 +3,7 @@ use std::sync::Arc;
 use crate::{
     encoding::{json2mp, mp2json},
     error::{self, AppError},
+    predicate::Predicate,
     storage,
 };
 use axum::{
@@ -14,8 +15,10 @@ use snafu::ResultExt;
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
-    doc_id: Option<Box<str>>,
+    query: Box<str>,
+    limit: Option<usize>,
 }
+
 #[derive(Serialize)]
 pub struct QueryResponse {
     results: Vec<serde_json::Value>,
@@ -62,25 +65,21 @@ pub(crate) async fn collection_query(
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
-    if let Some(doc_id) = req.doc_id {
-        match state.db.get_doc(&db, &collection, doc_id.as_ref()).await? {
-            Some(r) => {
-                return Ok(Json(QueryResponse {
-                    results: vec![mp2json(r)],
-                }));
-            }
-            None => {
-                return Ok(Json(QueryResponse {
-                    results: Vec::new(),
-                }));
-            }
+    let query_result = state
+        .db
+        .query(&db, &collection, &req.query, req.limit)
+        .await?;
+    let mut results = Vec::with_capacity(query_result.len());
+    for doc in query_result {
+        if let rmpv::Value::Map(mut items) = doc.doc {
+            items.push((
+                rmpv::Value::from("__id"),
+                rmpv::Value::from(String::from(&doc.id)),
+            ));
+            results.push(mp2json(rmpv::Value::Map(items)));
         }
-    } else {
-        return error::BadRequest {
-            e: "specify doc_id",
-        }
-        .fail();
     }
+    Ok(Json(QueryResponse { results }))
 }
 
 pub(crate) async fn collection_set(
@@ -93,7 +92,9 @@ pub(crate) async fn collection_set(
         .insert_doc(&db, &collection, json2mp(req.doc))
         .await?;
 
-    Ok(Json(SetResponse { id: id.into() }))
+    Ok(Json(SetResponse {
+        id: String::from(&id).into_boxed_str(),
+    }))
 }
 
 pub(crate) async fn collection_update(

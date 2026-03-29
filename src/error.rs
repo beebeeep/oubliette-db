@@ -19,6 +19,10 @@ pub enum AppError {
     FdbTransactionCommit {
         source: foundationdb::TransactionCommitError,
     },
+    #[snafu(display("key decode error"), context(suffix(false)))]
+    FdbTupleUnpack {
+        source: foundationdb::tuple::PackError,
+    },
 
     #[snafu(display("MessagePack encode error"), context(suffix(false)))]
     MPVEncode {
@@ -119,6 +123,11 @@ impl IntoResponse for AppError {
             AppError::QueryParse { e, source } => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("{e}: {source}")})),
+            )
+                .into_response(),
+            AppError::FdbTupleUnpack { source } => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json! ({"error": format!("decoding key tuple: {source}")})),
             )
                 .into_response(),
         }

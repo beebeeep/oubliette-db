@@ -1,8 +1,13 @@
-use crate::error::{self, AppError, MPVDecode};
-use foundationdb::{
-    options::MutationType,
-    tuple::{Subspace, Versionstamp},
+use crate::{
+    error::{self, AppError, MPVDecode},
+    predicate::Predicate,
 };
+use foundationdb::{
+    RangeOption,
+    options::MutationType,
+    tuple::{self, Subspace, Versionstamp},
+};
+use futures::StreamExt;
 use snafu::ResultExt;
 
 const PK: &'static str = "pk";
@@ -13,15 +18,20 @@ pub(crate) struct DB {
     fdb: foundationdb::Database,
 }
 
+pub(crate) struct Document {
+    pub(crate) id: DocID,
+    pub(crate) doc: rmpv::Value,
+}
+
 impl DocID {
     fn as_slice_ref(&self) -> &[u8] {
         &self.0.as_slice()
     }
 }
 
-impl Into<Box<str>> for DocID {
-    fn into(self) -> Box<str> {
-        hex::encode(self.0).into_boxed_str()
+impl From<&DocID> for String {
+    fn from(d: &DocID) -> Self {
+        hex::encode(d.0)
     }
 }
 
@@ -106,6 +116,51 @@ impl DB {
         let versionstamp = Versionstamp::complete(versionstamp, 0);
 
         Ok(DocID(versionstamp.as_bytes().clone()))
+    }
+
+    pub(crate) async fn query(
+        &self,
+        db: &str,
+        collection: &str,
+        query: &str,
+        limit: Option<usize>,
+    ) -> Result<Vec<Document>, AppError> {
+        let p = Predicate::from_query(query).whatever_context("parsing query")?;
+        let mut query_result = Vec::with_capacity(1);
+
+        let tx = self.fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        // TODO: implement query planner lol
+        // doing fullscan instead
+        let subspace = Subspace::all().subspace(&(db, collection, PK));
+        let opts = RangeOption::from(&subspace);
+        let mut results = tx.get_ranges(opts, false);
+        while let Some(docs) = results.next().await {
+            let docs = docs.context(error::Fdb {
+                e: "streaming documents from FDB",
+            })?;
+            for doc in docs {
+                let (_db, _collection, _pk, versionstamp) =
+                    tuple::unpack::<(String, String, String, Versionstamp)>(doc.key())
+                        .context(error::FdbTupleUnpack)?;
+                let value =
+                    rmpv::decode::read_value(&mut doc.value()).context(error::MPVDecode {
+                        e: "decoding document",
+                    })?;
+                let id = DocID(*versionstamp.as_bytes());
+                if p.execute(&String::from(&id), &value)? {
+                    query_result.push(Document { id, doc: value });
+                }
+                if let Some(l) = limit
+                    && query_result.len() >= l
+                {
+                    return Ok(query_result);
+                }
+            }
+        }
+
+        Ok(query_result)
     }
 
     /// queries single doc by id
