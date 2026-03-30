@@ -24,6 +24,7 @@ pub(crate) struct Document {
 }
 
 impl DocID {
+    #[allow(dead_code)]
     fn as_slice_ref(&self) -> &[u8] {
         &self.0.as_slice()
     }
@@ -189,6 +190,15 @@ impl DB {
         }
     }
 
+    pub(crate) async fn add_index(
+        &self,
+        db: &str,
+        collection: &str,
+        field: &str,
+    ) -> Result<(), AppError> {
+        todo!()
+    }
+
     fn validate_doc(doc: &rmpv::Value) -> Result<(), AppError> {
         if let rmpv::Value::Map(v) = doc {
             for (k, _) in v {
@@ -207,9 +217,18 @@ impl DB {
             }
             .fail()
         }
+
+        // TODO: recursively validate document: all maps shall be have key of type string and key (i.e. field name) must match /[-_a-zA-Z0-9]+/
+
+        // TODO: implement emergent database schema:
+        // 1. Field type is not enforced until first document containing that field is inserted.
+        // 2. Upon insertion, the inserted field name and its type become a contract,
+        //    and all subsequent documents with same field shall have the same type
+        // 3. Field names in nested documents are flattened, e.g. ".foo.bar.baz"
     }
 }
 
+#[allow(dead_code)]
 fn dump_key(key: &[u8]) -> String {
     let mut r = String::new();
     for b in key {

@@ -21,9 +21,14 @@ async fn main() -> Result<(), AppError> {
     let app = Router::new()
         .route("/fdb/{key}", get(http_api::fdb_get))
         .route("/fdb/{key}", put(http_api::fdb_set))
+        .route(
+            "/{db}/{collection}/{doc_id}",
+            get(http_api::collection_get_doc),
+        )
         .route("/{db}/{collection}", post(http_api::collection_query))
         .route("/{db}/{collection}", put(http_api::collection_set))
         .route("/{db}/{collection}", patch(http_api::collection_update))
+        .route("/indexes/{db}/{collection}", put(http_api::add_index))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("localhost:4800")
         .await

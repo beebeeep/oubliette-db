@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{process::id, sync::Arc};
 
 use crate::{
     encoding::{json2mp, mp2json},
@@ -39,6 +39,19 @@ pub struct SetResponse {
     id: Box<str>,
 }
 
+#[derive(Deserialize)]
+pub struct AddIndexRequest {
+    fields: Vec<Box<str>>,
+}
+
+#[derive(Serialize)]
+pub struct AddIndexResponse {}
+
+#[derive(Serialize)]
+pub struct GetDocResponse {
+    doc: Option<serde_json::Value>,
+}
+
 pub struct AppState {
     pub db: storage::DB,
 }
@@ -58,6 +71,16 @@ pub async fn fdb_get(
     Path(key): Path<String>,
 ) -> Result<Box<[u8]>, AppError> {
     state.db.fdb_get(key.as_bytes()).await
+}
+
+pub(crate) async fn collection_get_doc(
+    State(state): State<Arc<AppState>>,
+    Path((db, collection, doc_id)): Path<(String, String, String)>,
+) -> Result<Json<GetDocResponse>, AppError> {
+    let doc = state.db.get_doc(&db, &collection, doc_id.as_str()).await?;
+    Ok(Json(GetDocResponse {
+        doc: doc.map(mp2json),
+    }))
 }
 
 pub(crate) async fn collection_query(
@@ -80,6 +103,17 @@ pub(crate) async fn collection_query(
         }
     }
     Ok(Json(QueryResponse { results }))
+}
+
+pub(crate) async fn add_index(
+    State(state): State<Arc<AppState>>,
+    Path((db, collection)): Path<(String, String)>,
+    Json(req): Json<AddIndexRequest>,
+) -> Result<Json<AddIndexResponse>, AppError> {
+    for field in req.fields {
+        state.db.add_index(&db, &collection, field.as_ref()).await?;
+    }
+    Ok(Json(AddIndexResponse {}))
 }
 
 pub(crate) async fn collection_set(

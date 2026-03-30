@@ -1,10 +1,6 @@
 use std::collections::HashMap;
 
-use crate::{
-    error::{self, AppError},
-    storage::DocID,
-};
-use foundationdb::tuple::TuplePack;
+use crate::error::{self, AppError};
 use sexpression::Expression;
 use snafu::{ResultExt, whatever};
 
