@@ -15,7 +15,7 @@ mod storage;
 async fn main() -> Result<(), AppError> {
     // safety: we drop network at the end of main
     let network = unsafe { foundationdb::boot() };
-    let db = storage::DB::from_path("./fdb.cluster")?;
+    let db = storage::DB::from_path("./fdb.cluster").await?;
     let state = Arc::new(http_api::AppState { db });
 
     let app = Router::new()

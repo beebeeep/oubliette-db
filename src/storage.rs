@@ -1,3 +1,8 @@
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, RwLock},
+};
+
 use crate::{
     error::{self, AppError, MPVDecode},
     predicate::Predicate,
@@ -8,19 +13,54 @@ use foundationdb::{
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
-const PK: &'static str = "pk";
+const SPACE_PK: &'static str = "pk";
+const SPACE_INDEX: &'static str = "ix";
+const SPACE_SCHEMA: &'static str = "schema";
 
 pub(crate) struct DocID([u8; 12]);
 
+type InstanceSchema = HashMap<(String, String), Schema>;
 pub(crate) struct DB {
     fdb: foundationdb::Database,
+    schema: Arc<RwLock<InstanceSchema>>,
 }
 
 pub(crate) struct Document {
     pub(crate) id: DocID,
     pub(crate) doc: rmpv::Value,
+}
+
+#[derive(Serialize, Deserialize)]
+enum DataType {
+    Integer,
+    Float,
+    String,
+    Boolean,
+    // will support non-scalar types later
+    // Array(Box<DataType>),
+    // Map(Box<DataType>),
+}
+
+#[derive(Serialize, Deserialize)]
+struct FieldDef {
+    name: String, // name is flattened path to field, e.g ".foo.bar.baz"
+    field_type: DataType,
+}
+
+#[derive(Serialize, Deserialize)]
+struct IndexDef {
+    name: String,
+    fields: Vec<String>,
+    ready: bool,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Schema {
+    fields: Vec<FieldDef>,
+    indexes: Vec<IndexDef>,
 }
 
 impl DocID {
@@ -51,10 +91,13 @@ impl TryFrom<&str> for DocID {
 }
 
 impl DB {
-    pub(crate) fn from_path(path: &str) -> Result<Self, AppError> {
+    pub(crate) async fn from_path(path: &str) -> Result<Self, AppError> {
+        let db =
+            foundationdb::Database::from_path(path).whatever_context("initializing database")?;
+
         Ok(Self {
-            fdb: foundationdb::Database::from_path(path)
-                .whatever_context("initializing database")?,
+            fdb: db,
+            schema: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
@@ -93,7 +136,7 @@ impl DB {
         Self::validate_doc(&doc)?;
 
         let subspace = Subspace::all().subspace(&(db, collection));
-        let kt = (PK, &Versionstamp::incomplete(0));
+        let kt = (SPACE_PK, &Versionstamp::incomplete(0));
         let key = subspace.pack_with_versionstamp(&kt);
 
         let tx = self.fdb.create_trx().context(error::Fdb {
@@ -134,7 +177,7 @@ impl DB {
         })?;
         // TODO: implement query planner lol
         // doing fullscan instead
-        let subspace = Subspace::all().subspace(&(db, collection, PK));
+        let subspace = Subspace::all().subspace(&(db, collection, SPACE_PK));
         let opts = RangeOption::from(&subspace);
         let mut results = tx.get_ranges(opts, false);
         while let Some(docs) = results.next().await {
@@ -173,7 +216,7 @@ impl DB {
     ) -> Result<Option<rmpv::Value>, AppError> {
         let id = id.try_into()?;
         let subspace = Subspace::all().subspace(&(db, collection));
-        let key = subspace.pack(&(PK, Versionstamp::from(id.0)));
+        let key = subspace.pack(&(SPACE_PK, Versionstamp::from(id.0)));
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
