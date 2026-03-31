@@ -16,9 +16,19 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
-const SPACE_PK: &'static str = "pk";
-const SPACE_INDEX: &'static str = "ix";
-const SPACE_SCHEMA: &'static str = "schema";
+const KEY_PK: &'static str = "pk";
+const KEY_INDEX: &'static str = "ix";
+const KEY_SCHEMA: &'static str = "schema";
+
+const SPACE_DATA: &'static str = "d";
+const SPACE_SCHEMA: &'static str = "m";
+
+/*
+    Key layout:
+    "d".db.collection."pk".doc_id -> [document value], where doc_id is versionstamp  | main data
+    "d".db.collection."ix".f1.f2.<...>.fn.doc_id -> null | secondary index over fields f1, f2, ... fn
+    "m".db.collection.schema -> [encoded Schema] | schema for that db and collection
+*/
 
 pub(crate) struct DocID([u8; 12]);
 
@@ -92,13 +102,14 @@ impl TryFrom<&str> for DocID {
 
 impl DB {
     pub(crate) async fn from_path(path: &str) -> Result<Self, AppError> {
-        let db =
-            foundationdb::Database::from_path(path).whatever_context("initializing database")?;
-
-        Ok(Self {
-            fdb: db,
+        let mut db = Self {
+            fdb: foundationdb::Database::from_path(path)
+                .whatever_context("initializing database")?,
             schema: Arc::new(RwLock::new(HashMap::new())),
-        })
+        };
+        db.load_schema().await.whatever_context("loading schema")?;
+
+        Ok(db)
     }
 
     /// sets raw key in FDB
@@ -135,8 +146,8 @@ impl DB {
     ) -> Result<DocID, AppError> {
         Self::validate_doc(&doc)?;
 
-        let subspace = Subspace::all().subspace(&(db, collection));
-        let kt = (SPACE_PK, &Versionstamp::incomplete(0));
+        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
+        let kt = (KEY_PK, &Versionstamp::incomplete(0));
         let key = subspace.pack_with_versionstamp(&kt);
 
         let tx = self.fdb.create_trx().context(error::Fdb {
@@ -177,7 +188,7 @@ impl DB {
         })?;
         // TODO: implement query planner lol
         // doing fullscan instead
-        let subspace = Subspace::all().subspace(&(db, collection, SPACE_PK));
+        let subspace = Subspace::all().subspace(&(db, collection, KEY_PK));
         let opts = RangeOption::from(&subspace);
         let mut results = tx.get_ranges(opts, false);
         while let Some(docs) = results.next().await {
@@ -185,8 +196,8 @@ impl DB {
                 e: "streaming documents from FDB",
             })?;
             for doc in docs {
-                let (_db, _collection, _pk, versionstamp) =
-                    tuple::unpack::<(String, String, String, Versionstamp)>(doc.key())
+                let (_space, _db, _collection, _pk, versionstamp) =
+                    tuple::unpack::<(String, String, String, String, Versionstamp)>(doc.key())
                         .context(error::FdbTupleUnpack)?;
                 let value =
                     rmpv::decode::read_value(&mut doc.value()).context(error::MPVDecode {
@@ -215,8 +226,8 @@ impl DB {
         id: impl TryInto<DocID, Error = AppError>,
     ) -> Result<Option<rmpv::Value>, AppError> {
         let id = id.try_into()?;
-        let subspace = Subspace::all().subspace(&(db, collection));
-        let key = subspace.pack(&(SPACE_PK, Versionstamp::from(id.0)));
+        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
+        let key = subspace.pack(&(KEY_PK, Versionstamp::from(id.0)));
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
@@ -240,6 +251,32 @@ impl DB {
         field: &str,
     ) -> Result<(), AppError> {
         todo!()
+    }
+
+    async fn load_schema(&self) -> Result<(), AppError> {
+        let tx = self.fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let opt = RangeOption::from(&Subspace::all().subspace(&(SPACE_SCHEMA)));
+        let mut result = tx.get_ranges(opt, false);
+        let mut schemas = self.schema.write().expect("poisoned lock");
+        while let Some(schema_values) = result.next().await {
+            let schema_values = schema_values.context(error::Fdb {
+                e: "getting schema from FDB",
+            })?;
+            for schema in schema_values {
+                let (_space, db, collection, _schema) =
+                    tuple::unpack::<(String, String, String, String)>(schema.key())
+                        .context(error::FdbTupleUnpack)?;
+                let collection_schema =
+                    Schema::deserialize(&mut rmp_serde::Deserializer::new(schema.value()))
+                        .context(error::MPDecode {
+                            e: format!("decoding schema for {db}.{collection}"),
+                        })?;
+                schemas.insert((db, collection), collection_schema);
+            }
+        }
+        Ok(())
     }
 
     fn validate_doc(doc: &rmpv::Value) -> Result<(), AppError> {
@@ -268,6 +305,53 @@ impl DB {
         // 2. Upon insertion, the inserted field name and its type become a contract,
         //    and all subsequent documents with same field shall have the same type
         // 3. Field names in nested documents are flattened, e.g. ".foo.bar.baz"
+    }
+
+    /// Takes MessagePack map items and recursively travereses through it, accumulating field names and their types
+    fn validate_object(
+        &self,
+        obj: &[(rmpv::Value, rmpv::Value)],
+        prefix: String,
+        fields: &mut Vec<(String, DataType)>,
+    ) -> Result<(), AppError> {
+        for (key, value) in obj {
+            match key {
+                rmpv::Value::String(field_name) => {
+                    if let Some(field_name) = field_name.as_str() {
+                        let field_name = format!("{prefix}.{field_name}");
+                        todo!("regex here");
+                        let field_type = match value {
+                            rmpv::Value::F32(_) => Some(DataType::Float),
+                            rmpv::Value::F64(_) => Some(DataType::Float),
+                            rmpv::Value::Boolean(_) => Some(DataType::Boolean),
+                            rmpv::Value::Integer(_) => Some(DataType::Integer),
+                            rmpv::Value::String(_) => Some(DataType::String),
+                            rmpv::Value::Map(items) => {
+                                self.validate_object(items, field_name.clone(), fields)?;
+                                None
+                            }
+                            _ => error::BadRequest {
+                                e: format!("field {field_name} has unsupported data type"),
+                            }
+                            .fail()?,
+                        };
+                        if let Some(field_type) = field_type {
+                            fields.push((field_name, field_type));
+                        }
+                    } else {
+                        error::BadRequest {
+                            e: format!("object {prefix} key is not valid utf-8"),
+                        }
+                        .fail()?
+                    }
+                }
+                _ => error::BadRequest {
+                    e: format!("object {prefix} key is not string"),
+                }
+                .fail()?,
+            }
+        }
+        Ok(())
     }
 }
 
