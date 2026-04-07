@@ -170,7 +170,6 @@ impl<'a> Val<'a> {
                         Val::new(self.values, list.get(1))? >= Val::new(self.values, list.get(2))?
                     }
                     "gt" => {
-                        eprintln!("{:?} > {:?}", list.get(1), list.get(2));
                         Val::new(self.values, list.get(1))? > Val::new(self.values, list.get(2))?
                     }
                     "le" => {

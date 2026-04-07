@@ -9,6 +9,7 @@ mod encoding;
 mod error;
 mod http_api;
 mod predicate;
+mod schema;
 mod storage;
 
 #[tokio::main]

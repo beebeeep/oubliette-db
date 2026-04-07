@@ -1,12 +1,13 @@
 use std::{
     collections::HashMap,
     fmt::Display,
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, LazyLock, Mutex, RwLock},
 };
 
 use crate::{
     error::{self, AppError, MPVDecode},
     predicate::Predicate,
+    schema::{self, InstanceSchema, KEY_PK, SPACE_DATA},
 };
 use foundationdb::{
     RangeOption,
@@ -17,68 +18,16 @@ use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
-const KEY_PK: &'static str = "pk";
-const KEY_INDEX: &'static str = "ix";
-const KEY_SCHEMA: &'static str = "schema";
-
-const SPACE_DATA: &'static str = "d";
-const SPACE_SCHEMA: &'static str = "m";
-
-/*
-    Key layout:
-    "d".db.collection."pk".doc_id -> [document value], where doc_id is versionstamp  | main data
-    "d".db.collection."ix".f1.f2.<...>.fn.doc_id -> null | secondary index over fields f1, f2, ... fn
-    "m".db.collection.schema -> [encoded Schema] | schema for that db and collection
-*/
-
 pub(crate) struct DocID([u8; 12]);
 
-type InstanceSchema = HashMap<(String, String), Schema>;
 pub(crate) struct DB {
     fdb: foundationdb::Database,
     schema: Arc<RwLock<InstanceSchema>>,
-    fld_name: regex::Regex,
 }
 
 pub(crate) struct Document {
     pub(crate) id: DocID,
     pub(crate) doc: rmpv::Value,
-}
-
-#[derive(Serialize, Deserialize, PartialEq)]
-enum DataType {
-    Integer,
-    Float,
-    String,
-    Boolean,
-    // will support non-scalar types later
-    // Array(Box<DataType>),
-    // Map(Box<DataType>),
-}
-
-impl Display for DataType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            DataType::Integer => "integer",
-            DataType::Float => "float",
-            DataType::String => "string",
-            DataType::Boolean => "boolean",
-        };
-        write!(f, "{s}")
-    }
-}
-
-#[derive(Serialize, Deserialize)]
-struct IndexDef {
-    name: String,
-    fields: Vec<String>,
-    ready: bool,
-}
-
-#[derive(Serialize, Deserialize)]
-struct Schema {
-    fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
-    indexes: Vec<IndexDef>,
 }
 
 impl DocID {
@@ -110,13 +59,13 @@ impl TryFrom<&str> for DocID {
 
 impl DB {
     pub(crate) async fn from_path(path: &str) -> Result<Self, AppError> {
+        let fdb =
+            foundationdb::Database::from_path(path).whatever_context("initializing database")?;
+        let s = InstanceSchema::load(&fdb).await?;
         let db = Self {
-            fdb: foundationdb::Database::from_path(path)
-                .whatever_context("initializing database")?,
-            schema: Arc::new(RwLock::new(HashMap::new())),
-            fld_name: regex::Regex::new(r"^[a-zA-Z][-_0-9a-zA-Z]*$").unwrap(),
+            fdb,
+            schema: Arc::new(RwLock::new(s)),
         };
-        db.load_schema().await.whatever_context("loading schema")?;
 
         Ok(db)
     }
@@ -153,7 +102,10 @@ impl DB {
         collection: &str,
         doc: rmpv::Value,
     ) -> Result<DocID, AppError> {
-        Self::validate_doc(&doc)?;
+        {
+            let mut schema = self.schema.write().expect("poisoned lock");
+            schema.validate_doc(db, collection, &doc)?;
+        }
 
         let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
         let kt = (KEY_PK, &Versionstamp::incomplete(0));
@@ -260,132 +212,6 @@ impl DB {
         field: &str,
     ) -> Result<(), AppError> {
         todo!()
-    }
-
-    async fn load_schema(&self) -> Result<(), AppError> {
-        let tx = self.fdb.create_trx().context(error::Fdb {
-            e: "starting transaction",
-        })?;
-        let opt = RangeOption::from(&Subspace::all().subspace(&(SPACE_SCHEMA)));
-        let mut result = tx.get_ranges(opt, false);
-        let mut schemas = self.schema.write().expect("poisoned lock");
-        while let Some(schema_values) = result.next().await {
-            let schema_values = schema_values.context(error::Fdb {
-                e: "getting schema from FDB",
-            })?;
-            for schema in schema_values {
-                let (_space, db, collection, _schema) =
-                    tuple::unpack::<(String, String, String, String)>(schema.key())
-                        .context(error::FdbTupleUnpack)?;
-                let collection_schema =
-                    Schema::deserialize(&mut rmp_serde::Deserializer::new(schema.value()))
-                        .context(error::MPDecode {
-                            e: format!("decoding schema for {db}.{collection}"),
-                        })?;
-                schemas.insert((db, collection), collection_schema);
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_doc(
-        &self,
-        db: &str,
-        collection: &str,
-        fields: &mut HashMap<String, DataType>,
-        doc: &rmpv::Value,
-    ) -> Result<(), AppError> {
-        if let rmpv::Value::Map(v) = doc {
-            self.validate_object(v, String::from("."), None);
-            todo!()
-        } else {
-            error::BadRequest {
-                e: "document must be an object",
-            }
-            .fail()?
-        }
-
-        // TODO: recursively validate document: all maps shall be have key of type string and key (i.e. field name) must match /[-_a-zA-Z0-9]+/
-
-        // TODO: implement emergent database schema:
-        // 1. Field type is not enforced until first document containing that field is inserted.
-        // 2. Upon insertion, the inserted field name and its type become a contract,
-        //    and all subsequent documents with same field shall have the same type
-        // 3. Field names in nested documents are flattened, e.g. ".foo.bar.baz"
-    }
-
-    /// Takes MessagePack map items and recursively travereses through it, accumulating field names and their types
-    fn validate_object(
-        &self,
-        obj: &[(rmpv::Value, rmpv::Value)],
-        prefix: String,
-        fields: &HashMap<String, DataType>,
-        mut new_fields: Option<Vec<(String, DataType)>>,
-    ) -> Result<Option<Vec<(String, DataType)>>, AppError> {
-        for (key, value) in obj {
-            let field_name = match key {
-                rmpv::Value::String(field_name) => field_name,
-                _ => error::BadRequest {
-                    e: format!("object {prefix} key is not string"),
-                }
-                .fail()?,
-            };
-            let field_name = match field_name.as_str() {
-                Some(s) => s,
-                None => error::BadRequest {
-                    e: format!("object {prefix} key is not valid utf-8"),
-                }
-                .fail()?,
-            };
-
-            if !self.fld_name.is_match(field_name) {
-                error::BadRequest {
-                    e: format!("bad field name '{field_name}'"),
-                }
-                .fail()?;
-            }
-
-            let field_name = format!("{prefix}.{field_name}");
-            let field_type = match value {
-                rmpv::Value::F32(_) => Some(DataType::Float),
-                rmpv::Value::F64(_) => Some(DataType::Float),
-                rmpv::Value::Boolean(_) => Some(DataType::Boolean),
-                rmpv::Value::Integer(_) => Some(DataType::Integer),
-                rmpv::Value::String(_) => Some(DataType::String),
-                rmpv::Value::Map(items) => {
-                    new_fields =
-                        self.validate_object(items, field_name.clone(), fields, new_fields)?;
-                    None
-                }
-                _ => error::BadRequest {
-                    e: format!("field {field_name} has unsupported data type"),
-                }
-                .fail()?,
-            };
-
-            if let Some(field_type) = field_type {
-                if let Some(existing_type) = fields.get(&field_name) {
-                    if field_type != *existing_type {
-                        error::BadRequest {
-                            e: format!(
-                                "field {field_name} should have type {existing_type}, but has {field_type}"
-                            ),
-                        }
-                        .fail()?
-                    }
-                } else {
-                    new_fields = match new_fields {
-                        Some(mut f) => {
-                            f.push((field_name, field_type));
-                            Some(f)
-                        }
-                        None => Some(vec![(field_name, field_type)]),
-                    };
-                }
-            }
-        }
-
-        Ok(new_fields)
     }
 }
 
