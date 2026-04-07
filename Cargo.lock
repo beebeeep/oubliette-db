@@ -607,6 +607,7 @@ dependencies = [
  "foundationdb",
  "futures",
  "hex",
+ "regex",
  "rmp-serde",
  "rmpv",
  "s-expression",

@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    fmt::Display,
     sync::{Arc, Mutex, RwLock},
 };
 
@@ -36,6 +37,7 @@ type InstanceSchema = HashMap<(String, String), Schema>;
 pub(crate) struct DB {
     fdb: foundationdb::Database,
     schema: Arc<RwLock<InstanceSchema>>,
+    fld_name: regex::Regex,
 }
 
 pub(crate) struct Document {
@@ -43,7 +45,7 @@ pub(crate) struct Document {
     pub(crate) doc: rmpv::Value,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, PartialEq)]
 enum DataType {
     Integer,
     Float,
@@ -54,10 +56,16 @@ enum DataType {
     // Map(Box<DataType>),
 }
 
-#[derive(Serialize, Deserialize)]
-struct FieldDef {
-    name: String, // name is flattened path to field, e.g ".foo.bar.baz"
-    field_type: DataType,
+impl Display for DataType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            DataType::Integer => "integer",
+            DataType::Float => "float",
+            DataType::String => "string",
+            DataType::Boolean => "boolean",
+        };
+        write!(f, "{s}")
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -69,7 +77,7 @@ struct IndexDef {
 
 #[derive(Serialize, Deserialize)]
 struct Schema {
-    fields: Vec<FieldDef>,
+    fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
     indexes: Vec<IndexDef>,
 }
 
@@ -102,10 +110,11 @@ impl TryFrom<&str> for DocID {
 
 impl DB {
     pub(crate) async fn from_path(path: &str) -> Result<Self, AppError> {
-        let mut db = Self {
+        let db = Self {
             fdb: foundationdb::Database::from_path(path)
                 .whatever_context("initializing database")?,
             schema: Arc::new(RwLock::new(HashMap::new())),
+            fld_name: regex::Regex::new(r"^[a-zA-Z][-_0-9a-zA-Z]*$").unwrap(),
         };
         db.load_schema().await.whatever_context("loading schema")?;
 
@@ -279,23 +288,21 @@ impl DB {
         Ok(())
     }
 
-    fn validate_doc(doc: &rmpv::Value) -> Result<(), AppError> {
+    fn validate_doc(
+        &self,
+        db: &str,
+        collection: &str,
+        fields: &mut HashMap<String, DataType>,
+        doc: &rmpv::Value,
+    ) -> Result<(), AppError> {
         if let rmpv::Value::Map(v) = doc {
-            for (k, _) in v {
-                if let rmpv::Value::String(_) = k {
-                    continue;
-                }
-                return error::BadRequest {
-                    e: "field name must be string",
-                }
-                .fail();
-            }
-            Ok(())
+            self.validate_object(v, String::from("."), None);
+            todo!()
         } else {
             error::BadRequest {
                 e: "document must be an object",
             }
-            .fail()
+            .fail()?
         }
 
         // TODO: recursively validate document: all maps shall be have key of type string and key (i.e. field name) must match /[-_a-zA-Z0-9]+/
@@ -312,46 +319,73 @@ impl DB {
         &self,
         obj: &[(rmpv::Value, rmpv::Value)],
         prefix: String,
-        fields: &mut Vec<(String, DataType)>,
-    ) -> Result<(), AppError> {
+        fields: &HashMap<String, DataType>,
+        mut new_fields: Option<Vec<(String, DataType)>>,
+    ) -> Result<Option<Vec<(String, DataType)>>, AppError> {
         for (key, value) in obj {
-            match key {
-                rmpv::Value::String(field_name) => {
-                    if let Some(field_name) = field_name.as_str() {
-                        let field_name = format!("{prefix}.{field_name}");
-                        todo!("regex here");
-                        let field_type = match value {
-                            rmpv::Value::F32(_) => Some(DataType::Float),
-                            rmpv::Value::F64(_) => Some(DataType::Float),
-                            rmpv::Value::Boolean(_) => Some(DataType::Boolean),
-                            rmpv::Value::Integer(_) => Some(DataType::Integer),
-                            rmpv::Value::String(_) => Some(DataType::String),
-                            rmpv::Value::Map(items) => {
-                                self.validate_object(items, field_name.clone(), fields)?;
-                                None
-                            }
-                            _ => error::BadRequest {
-                                e: format!("field {field_name} has unsupported data type"),
-                            }
-                            .fail()?,
-                        };
-                        if let Some(field_type) = field_type {
-                            fields.push((field_name, field_type));
-                        }
-                    } else {
-                        error::BadRequest {
-                            e: format!("object {prefix} key is not valid utf-8"),
-                        }
-                        .fail()?
-                    }
-                }
+            let field_name = match key {
+                rmpv::Value::String(field_name) => field_name,
                 _ => error::BadRequest {
                     e: format!("object {prefix} key is not string"),
                 }
                 .fail()?,
+            };
+            let field_name = match field_name.as_str() {
+                Some(s) => s,
+                None => error::BadRequest {
+                    e: format!("object {prefix} key is not valid utf-8"),
+                }
+                .fail()?,
+            };
+
+            if !self.fld_name.is_match(field_name) {
+                error::BadRequest {
+                    e: format!("bad field name '{field_name}'"),
+                }
+                .fail()?;
+            }
+
+            let field_name = format!("{prefix}.{field_name}");
+            let field_type = match value {
+                rmpv::Value::F32(_) => Some(DataType::Float),
+                rmpv::Value::F64(_) => Some(DataType::Float),
+                rmpv::Value::Boolean(_) => Some(DataType::Boolean),
+                rmpv::Value::Integer(_) => Some(DataType::Integer),
+                rmpv::Value::String(_) => Some(DataType::String),
+                rmpv::Value::Map(items) => {
+                    new_fields =
+                        self.validate_object(items, field_name.clone(), fields, new_fields)?;
+                    None
+                }
+                _ => error::BadRequest {
+                    e: format!("field {field_name} has unsupported data type"),
+                }
+                .fail()?,
+            };
+
+            if let Some(field_type) = field_type {
+                if let Some(existing_type) = fields.get(&field_name) {
+                    if field_type != *existing_type {
+                        error::BadRequest {
+                            e: format!(
+                                "field {field_name} should have type {existing_type}, but has {field_type}"
+                            ),
+                        }
+                        .fail()?
+                    }
+                } else {
+                    new_fields = match new_fields {
+                        Some(mut f) => {
+                            f.push((field_name, field_type));
+                            Some(f)
+                        }
+                        None => Some(vec![(field_name, field_type)]),
+                    };
+                }
             }
         }
-        Ok(())
+
+        Ok(new_fields)
     }
 }
 
