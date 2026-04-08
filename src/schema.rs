@@ -27,6 +27,7 @@ static FLD_NAME_RE: LazyLock<regex::Regex> =
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct InstanceSchema {
+    version: u32,
     schemas: HashMap<(String, String), CollectionSchema>,
 }
 
@@ -54,6 +55,14 @@ enum DataType {
     // Map(Box<DataType>),
 }
 
+pub(crate) struct ValidationResult {
+    schema_changed: bool,
+    affected_indexes: Option<Vec<String>>,
+}
+
+type NewFields = Vec<(String, DataType)>;
+type ReferredFields = Vec<String>;
+
 impl Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
@@ -67,6 +76,7 @@ impl Display for DataType {
 }
 
 impl InstanceSchema {
+    /// Loads schema from FDB
     pub(crate) async fn load(fdb: &foundationdb::Database) -> Result<Self, AppError> {
         let tx = fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
@@ -84,32 +94,83 @@ impl InstanceSchema {
         Ok(schema)
     }
 
+    /// Validates document against schema.
+    /// Oubliette leverages concept of "emergent schema": schema evolution is automatic,
+    /// the type of each field is determined by first inserted document containing that field.
+    /// Any schema changes will update the in-memory representation of schema (i.e., the self),
+    /// but will not write them to FDB.
+    ///
+    /// Also returns list of secondary indexes that shall be updated upon insertion of the document.
     pub(crate) fn validate_doc(
         &mut self,
         db: &str,
         collection: &str,
         doc: &rmpv::Value,
-    ) -> Result<(), AppError> {
-        // TODO: this should also return list of indexed fields (perhaps with values?) to write secondary indexes
-        if let rmpv::Value::Map(v) = doc {
-            {
-                let schema = self
-                    .schemas
-                    .entry((String::from(db), String::from(collection)))
-                    .or_insert(CollectionSchema::default());
-                if let Some(new_fields) =
-                    Self::validate_object(v, String::from(""), &schema.fields, None)?
-                {
-                    schema.fields.extend(new_fields);
-                }
-            }
-            Ok(())
-        } else {
+    ) -> Result<ValidationResult, AppError> {
+        let rmpv::Value::Map(doc) = doc else {
             error::Validation {
                 e: "document must be an object",
             }
             .fail()?
+        };
+
+        let mut result = ValidationResult {
+            schema_changed: false,
+            affected_indexes: None,
+        };
+        let schema = self
+            .schemas
+            .entry((String::from(db), String::from(collection)))
+            .or_insert(CollectionSchema::default());
+
+        let (referred_fields, new_fields) = Self::validate_object(
+            doc,
+            String::from(""),
+            &schema.fields,
+            Vec::with_capacity(schema.fields.len()),
+            None,
+        )?;
+        if let Some(new_fields) = new_fields {
+            result.schema_changed = true;
+            schema.fields.extend(new_fields);
         }
+        for field in referred_fields {
+            for index in &schema.indexes {
+                if index.fields.contains(&field) {
+                    let n = index.name.clone();
+                    result.affected_indexes = match result.affected_indexes {
+                        Some(mut a) => {
+                            if !a.contains(&n) {
+                                a.push(n);
+                            }
+                            Some(a)
+                        }
+                        None => Some(vec![n]),
+                    };
+                }
+            }
+        }
+
+        Ok(result)
+    }
+
+    /// adds new index to in-memory representation of schema. Does not write schema to FDB!
+    pub(crate) fn add_index(
+        &mut self,
+        db: &str,
+        collection: &str,
+        name: String,
+        fields: Vec<String>,
+    ) {
+        let schema = self
+            .schemas
+            .entry((String::from(db), String::from(collection)))
+            .or_insert(CollectionSchema::default());
+        schema.indexes.push(IndexDef {
+            name,
+            fields,
+            ready: false,
+        });
     }
 
     /// Takes MessagePack map items and recursively travereses through it, accumulating field names and their types
@@ -117,22 +178,21 @@ impl InstanceSchema {
         obj: &[(rmpv::Value, rmpv::Value)],
         prefix: String,
         fields: &HashMap<String, DataType>,
-        mut new_fields: Option<Vec<(String, DataType)>>,
-    ) -> Result<Option<Vec<(String, DataType)>>, AppError> {
+        mut referred_fields: ReferredFields,
+        mut new_fields: Option<NewFields>,
+    ) -> Result<(ReferredFields, Option<NewFields>), AppError> {
         for (key, value) in obj {
-            let field_name = match key {
-                rmpv::Value::String(field_name) => field_name,
-                _ => error::Validation {
+            let rmpv::Value::String(field_name) = key else {
+                error::Validation {
                     e: format!("object {prefix} key is not string"),
                 }
-                .fail()?,
+                .fail()?
             };
-            let field_name = match field_name.as_str() {
-                Some(s) => s,
-                None => error::Validation {
+            let Some(field_name) = field_name.as_str() else {
+                error::Validation {
                     e: format!("object {prefix} key is not valid utf-8"),
                 }
-                .fail()?,
+                .fail()?
             };
 
             if !FLD_NAME_RE.is_match(field_name) {
@@ -150,8 +210,13 @@ impl InstanceSchema {
                 rmpv::Value::Integer(_) => Some(DataType::Integer),
                 rmpv::Value::String(_) => Some(DataType::String),
                 rmpv::Value::Map(items) => {
-                    new_fields =
-                        Self::validate_object(items, field_name.clone(), fields, new_fields)?;
+                    (referred_fields, new_fields) = Self::validate_object(
+                        items,
+                        field_name.clone(),
+                        fields,
+                        referred_fields,
+                        new_fields,
+                    )?;
                     None
                 }
                 _ => error::Validation {
@@ -160,29 +225,33 @@ impl InstanceSchema {
                 .fail()?,
             };
 
-            if let Some(field_type) = field_type {
-                if let Some(existing_type) = fields.get(&field_name) {
-                    if field_type != *existing_type {
-                        error::Validation {
+            let Some(field_type) = field_type else {
+                continue;
+            };
+            if let Some(existing_type) = fields.get(&field_name) {
+                if field_type != *existing_type {
+                    error::Validation {
                             e: format!(
                                 "field {field_name} should have type {existing_type}, but has {field_type}"
                             ),
                         }
                         .fail()?
-                    }
-                } else {
-                    new_fields = match new_fields {
-                        Some(mut f) => {
-                            f.push((field_name, field_type));
-                            Some(f)
-                        }
-                        None => Some(vec![(field_name, field_type)]),
-                    };
                 }
+            } else {
+                // new field was added
+                let field_name = field_name.clone();
+                new_fields = match new_fields {
+                    Some(mut f) => {
+                        f.push((field_name, field_type));
+                        Some(f)
+                    }
+                    None => Some(vec![(field_name, field_type)]),
+                };
             }
+            referred_fields.push(field_name);
         }
 
-        Ok(new_fields)
+        Ok((referred_fields, new_fields))
     }
 }
 
@@ -190,27 +259,41 @@ impl InstanceSchema {
 mod tests {
     use crate::{
         encoding::json2mp,
-        schema::{DataType, FLD_NAME_RE, InstanceSchema},
-    };
-    use std::{
-        str::FromStr,
-        sync::{Arc, RwLock},
+        schema::{DataType, InstanceSchema},
     };
 
     fn j(s: &str) -> rmpv::Value {
-        json2mp(serde_json::Value::from_str(s).unwrap())
+        json2mp(serde_json::from_str(s).unwrap())
     }
 
     #[test]
     fn doc_validation() {
         let mut schema = InstanceSchema::default();
+        schema.add_index(
+            "testdb",
+            "testcol",
+            String::from("idx_foo"),
+            vec![String::from(".foo")],
+        );
+        schema.add_index(
+            "testdb",
+            "testcol",
+            String::from("idx_foo_barbaz"),
+            vec![String::from(".foo"), String::from(".bar.baz")],
+        );
 
         assert!(schema.validate_doc("testdb", "testcol", &j("137")).is_err());
 
-        assert!(
-            schema
-                .validate_doc("testdb", "testcol", &j(r#"{"foo": 137}"#))
-                .is_ok()
+        let r = schema
+            .validate_doc("testdb", "testcol", &j(r#"{"foo": 137}"#))
+            .unwrap();
+        assert!(r.schema_changed);
+        assert_eq!(
+            r.affected_indexes,
+            Some(vec![
+                String::from("idx_foo"),
+                String::from("idx_foo_barbaz")
+            ])
         );
 
         assert!(
@@ -219,14 +302,13 @@ mod tests {
                 .is_err()
         );
 
-        assert!(
-            schema
-                .validate_doc(
-                    "testdb",
-                    "testcol",
-                    &j(r#"{"foo": 137, "bar": {"baz": "chlos"}}"#)
-                )
-                .is_ok()
+        let r = schema
+            .validate_doc("testdb", "testcol", &j(r#"{"bar": {"baz": "chlos"}}"#))
+            .unwrap();
+        assert!(r.schema_changed);
+        assert_eq!(
+            r.affected_indexes,
+            Some(vec![String::from("idx_foo_barbaz")])
         );
 
         assert!(
@@ -239,34 +321,41 @@ mod tests {
                 .is_err()
         );
 
-        assert!(
-            schema
-                .validate_doc(
-                    "testdb",
-                    "testcol",
-                    &j(r#"{"foo": 138, "bar": {"baq": 12.3}}"#)
-                )
-                .is_ok()
-        );
-        assert!(
-            schema
-                .validate_doc(
-                    "testdb",
-                    "testcol",
-                    &j(r#"{"foo": 139, "bar": {"baz": "CHLOS", "baq": 12.3}}"#)
-                )
-                .is_ok()
+        let r = schema
+            .validate_doc(
+                "testdb",
+                "testcol",
+                &j(r#"{"foo": 138, "bar": {"baq": 12.3}}"#),
+            )
+            .unwrap();
+        assert!(r.schema_changed);
+
+        let r = schema
+            .validate_doc(
+                "testdb",
+                "testcol",
+                &j(r#"{"foo": 139, "bar": {"baz": "CHLOS", "baq": 12.3}}"#),
+            )
+            .unwrap();
+        assert!(!r.schema_changed);
+        assert_eq!(
+            r.affected_indexes,
+            Some(vec![
+                String::from("idx_foo_barbaz"),
+                String::from("idx_foo"),
+            ])
         );
 
-        assert!(
-            schema
-                .validate_doc(
-                    "testdb",
-                    "testcol",
-                    &j(r#"{"bar": {"baw": {"foo": true}}}"#)
-                )
-                .is_ok()
-        );
+        let r = schema
+            .validate_doc(
+                "testdb",
+                "testcol",
+                &j(r#"{"bar": {"baw": {"foo": true}}}"#),
+            )
+            .unwrap();
+
+        assert!(r.schema_changed);
+        assert!(r.affected_indexes.is_none());
 
         let dbs = schema
             .schemas
