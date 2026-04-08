@@ -786,8 +786,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s-expression"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28cdbff21b92ec6fa85f9e5c65e979f4acbaa62824beb9f55ebe33dd7b6857bc"
+source = "git+https://github.com/beebeeep/s-expression?branch=fix-single-character-tokens#ccdde80df2c552ab56d743812942cac9e661c37d"
 dependencies = [
  "thiserror",
 ]

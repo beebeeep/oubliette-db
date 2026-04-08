@@ -15,7 +15,6 @@ use foundationdb::{
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
-use serde::{Deserialize, Serialize};
 use snafu::ResultExt;
 
 pub(crate) struct DocID([u8; 12]);

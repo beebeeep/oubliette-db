@@ -11,7 +11,7 @@ pub(crate) struct Predicate<'a> {
 
 impl<'a> Predicate<'a> {
     pub(crate) fn from_query(query: &'a str) -> Result<Self, AppError> {
-        let expression = sexpression::read(query).context(error::QueryParse {
+        let (expression, _) = sexpression::read(query).context(error::QueryParse {
             e: "failed to parse query",
         })?;
 

@@ -12,7 +12,7 @@ hex = "0.4.3"
 regex = "1.12.3"
 rmp-serde = "1.3.1"
 rmpv = "1.3.1"
-s-expression = "0.2.0"
+s-expression = { git = "https://github.com/beebeeep/s-expression", branch = "fix-single-character-tokens" } # TODO: go back to crates.io version as soon as author releases new version with fix
 serde = { version = "1.0.228", features = ["derive"] }
 serde-transcode = "1.1.1"
 serde_json = "1.0.149"

@@ -10,34 +10,46 @@ use snafu::ResultExt;
 
 use crate::error::{self, AppError};
 
+/*
+    Key layout:
+    "d".db.collection."pk".doc_id -> [document value], where doc_id is versionstamp  | main data
+    "d".db.collection."ix".f1.f2.<...>.fn.doc_id -> null                             | secondary index over fields f1, f2, ... fn
+    "m"."schema" -> [encoded InstanceSchema]                                         | instance schema
+*/
 pub(crate) const SPACE_DATA: &'static str = "d";
-pub(crate) const SPACE_SCHEMA: &'static str = "m";
+pub(crate) const SPACE_META: &'static str = "m";
 pub(crate) const KEY_PK: &'static str = "pk";
 pub(crate) const KEY_INDEX: &'static str = "ix";
 pub(crate) const KEY_SCHEMA: &'static str = "schema";
 
-/*
-    Key layout:
-    "d".db.collection."pk".doc_id -> [document value], where doc_id is versionstamp  | main data
-    "d".db.collection."ix".f1.f2.<...>.fn.doc_id -> null | secondary index over fields f1, f2, ... fn
-    "m".db.collection.schema -> [encoded Schema] | schema for that db and collection
-*/
-
 static FLD_NAME_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z][-_0-9a-zA-Z]*$").unwrap());
 
-#[derive(Default)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct InstanceSchema {
-    schemas: HashMap<(String, String), Schema>,
+    schemas: HashMap<(String, String), CollectionSchema>,
 }
 
-#[derive(Serialize, Deserialize, PartialEq)]
+#[derive(Serialize, Deserialize, Default, Debug)]
+struct CollectionSchema {
+    fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
+    indexes: Vec<IndexDef>,
+}
+
+#[derive(Serialize, Deserialize, Debug)]
+struct IndexDef {
+    name: String,
+    fields: Vec<String>,
+    ready: bool,
+}
+
+#[derive(Serialize, Deserialize, PartialEq, Debug)]
 enum DataType {
     Integer,
     Float,
     String,
     Boolean,
-    // will support non-scalar types later
+    // TODO: add support non-scalar types
     // Array(Box<DataType>),
     // Map(Box<DataType>),
 }
@@ -54,45 +66,22 @@ impl Display for DataType {
     }
 }
 
-#[derive(Serialize, Deserialize)]
-struct IndexDef {
-    name: String,
-    fields: Vec<String>,
-    ready: bool,
-}
-
-#[derive(Serialize, Deserialize, Default)]
-struct Schema {
-    fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
-    indexes: Vec<IndexDef>,
-}
-
 impl InstanceSchema {
     pub(crate) async fn load(fdb: &foundationdb::Database) -> Result<Self, AppError> {
         let tx = fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
-        let opt = RangeOption::from(&Subspace::all().subspace(&(SPACE_SCHEMA)));
-        let mut result = tx.get_ranges(opt, false);
-
-        let mut schemas = HashMap::new();
-        while let Some(schema_values) = result.next().await {
-            let schema_values = schema_values.context(error::Fdb {
-                e: "getting schema from FDB",
-            })?;
-            for schema in schema_values {
-                let (_space, db, collection, _schema) =
-                    tuple::unpack::<(String, String, String, String)>(schema.key())
-                        .context(error::FdbTupleUnpack)?;
-                let collection_schema =
-                    Schema::deserialize(&mut rmp_serde::Deserializer::new(schema.value()))
-                        .context(error::MPDecode {
-                            e: format!("decoding schema for {db}.{collection}"),
-                        })?;
-                schemas.insert((db, collection), collection_schema);
-            }
-        }
-        Ok(Self { schemas })
+        let key = Subspace::from_bytes(SPACE_META).pack(&(KEY_SCHEMA));
+        let schema = match tx.get(&key, false).await.context(error::Fdb {
+            e: "getting schema from FDB",
+        })? {
+            Some(d) => InstanceSchema::deserialize(&mut rmp_serde::Deserializer::new(d.as_ref()))
+                .context(error::MPDecode {
+                e: "decoding schema",
+            })?,
+            None => Self::default(),
+        };
+        Ok(schema)
     }
 
     pub(crate) fn validate_doc(
@@ -107,9 +96,9 @@ impl InstanceSchema {
                 let schema = self
                     .schemas
                     .entry((String::from(db), String::from(collection)))
-                    .or_insert(Schema::default());
+                    .or_insert(CollectionSchema::default());
                 if let Some(new_fields) =
-                    Self::validate_object(v, String::from("."), &schema.fields, None)?
+                    Self::validate_object(v, String::from(""), &schema.fields, None)?
                 {
                     schema.fields.extend(new_fields);
                 }
@@ -201,7 +190,7 @@ impl InstanceSchema {
 mod tests {
     use crate::{
         encoding::json2mp,
-        schema::{FLD_NAME_RE, InstanceSchema},
+        schema::{DataType, FLD_NAME_RE, InstanceSchema},
     };
     use std::{
         str::FromStr,
@@ -209,8 +198,7 @@ mod tests {
     };
 
     fn j(s: &str) -> rmpv::Value {
-        let jsonv = serde_json::Value::from_str(s).unwrap();
-        json2mp(jsonv)
+        json2mp(serde_json::Value::from_str(s).unwrap())
     }
 
     #[test]
@@ -240,5 +228,54 @@ mod tests {
                 )
                 .is_ok()
         );
+
+        assert!(
+            schema
+                .validate_doc(
+                    "testdb",
+                    "testcol",
+                    &j(r#"{"foo": 137, "bar": {"baz": 12.3}}"#)
+                )
+                .is_err()
+        );
+
+        assert!(
+            schema
+                .validate_doc(
+                    "testdb",
+                    "testcol",
+                    &j(r#"{"foo": 138, "bar": {"baq": 12.3}}"#)
+                )
+                .is_ok()
+        );
+        assert!(
+            schema
+                .validate_doc(
+                    "testdb",
+                    "testcol",
+                    &j(r#"{"foo": 139, "bar": {"baz": "CHLOS", "baq": 12.3}}"#)
+                )
+                .is_ok()
+        );
+
+        assert!(
+            schema
+                .validate_doc(
+                    "testdb",
+                    "testcol",
+                    &j(r#"{"bar": {"baw": {"foo": true}}}"#)
+                )
+                .is_ok()
+        );
+
+        let dbs = schema
+            .schemas
+            .get(&(String::from("testdb"), String::from("testcol")))
+            .unwrap();
+        assert_eq!(dbs.fields.len(), 4);
+        assert_eq!(dbs.fields.get(".foo"), Some(&DataType::Integer));
+        assert_eq!(dbs.fields.get(".bar.baz"), Some(&DataType::String));
+        assert_eq!(dbs.fields.get(".bar.baq"), Some(&DataType::Float));
+        assert_eq!(dbs.fields.get(".bar.baw.foo"), Some(&DataType::Boolean));
     }
 }
