@@ -47,6 +47,12 @@ pub struct AddIndexRequest {
 #[derive(Serialize)]
 pub struct AddIndexResponse {}
 
+#[derive(Deserialize)]
+pub struct CreateCollectionRequest {}
+
+#[derive(Serialize)]
+pub struct CreateCollectionResponse {}
+
 #[derive(Serialize)]
 pub struct GetDocResponse {
     doc: Option<serde_json::Value>,
@@ -105,17 +111,6 @@ pub(crate) async fn collection_query(
     Ok(Json(QueryResponse { results }))
 }
 
-pub(crate) async fn add_index(
-    State(state): State<Arc<AppState>>,
-    Path((db, collection)): Path<(String, String)>,
-    Json(req): Json<AddIndexRequest>,
-) -> Result<Json<AddIndexResponse>, AppError> {
-    for field in req.fields {
-        state.db.add_index(&db, &collection, field.as_ref()).await?;
-    }
-    Ok(Json(AddIndexResponse {}))
-}
-
 pub(crate) async fn collection_set(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
@@ -129,6 +124,29 @@ pub(crate) async fn collection_set(
     Ok(Json(SetResponse {
         id: String::from(&id).into_boxed_str(),
     }))
+}
+
+pub(crate) async fn create_collection(
+    State(state): State<Arc<AppState>>,
+    Path((db, collection)): Path<(String, String)>,
+    Json(_req): Json<CreateCollectionRequest>,
+) -> Result<Json<CreateCollectionResponse>, AppError> {
+    state.db.create_collection(&db, &collection).await?;
+    Ok(Json(CreateCollectionResponse {}))
+}
+
+pub(crate) async fn add_index(
+    State(state): State<Arc<AppState>>,
+    Path((db, collection)): Path<(String, String)>,
+    Json(req): Json<AddIndexRequest>,
+) -> Result<Json<AddIndexResponse>, AppError> {
+    for field in req.fields {
+        state
+            .db
+            .create_index(&db, &collection, field.as_ref())
+            .await?;
+    }
+    Ok(Json(AddIndexResponse {}))
 }
 
 pub(crate) async fn collection_update(

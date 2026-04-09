@@ -1,9 +1,9 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use crate::{
     error::{self, AppError, MPVDecode},
     predicate::Predicate,
-    schema::{InstanceSchema, KEY_PK, SPACE_DATA},
+    schema::{CollectionSchema, InstanceSchema, KEY_PK, SPACE_DATA, SchemaVersion},
 };
 use foundationdb::{
     RangeOption,
@@ -13,11 +13,22 @@ use foundationdb::{
 use futures::StreamExt;
 use snafu::ResultExt;
 
-pub(crate) struct DocID([u8; 12]);
+pub(crate) struct DocID {
+    schema: SchemaVersion,
+    versionstamp: Versionstamp,
+}
+impl DocID {
+    fn new(schema: SchemaVersion, versionstamp: Versionstamp) -> Self {
+        Self {
+            schema,
+            versionstamp,
+        }
+    }
+}
 
 pub(crate) struct DB {
     fdb: foundationdb::Database,
-    schema: Arc<RwLock<InstanceSchema>>,
+    schema: Arc<tokio::sync::RwLock<InstanceSchema>>,
 }
 
 pub(crate) struct Document {
@@ -25,16 +36,11 @@ pub(crate) struct Document {
     pub(crate) doc: rmpv::Value,
 }
 
-impl DocID {
-    #[allow(dead_code)]
-    fn as_slice_ref(&self) -> &[u8] {
-        &self.0.as_slice()
-    }
-}
-
 impl From<&DocID> for String {
     fn from(d: &DocID) -> Self {
-        hex::encode(d.0)
+        let mut s = hex::encode(d.schema.to_le_bytes());
+        s.push_str(&hex::encode(d.versionstamp.as_bytes()));
+        s
     }
 }
 
@@ -42,13 +48,23 @@ impl TryFrom<&str> for DocID {
     type Error = AppError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        let v = hex::decode(value).context(error::DocIDDecode)?;
-        if v.len() != 12 {
+        if value.len() != 2 * size_of::<SchemaVersion>() + 12 {
             return Err(AppError::DocIDDecode {
                 source: hex::FromHexError::InvalidStringLength,
             });
         }
-        Ok(Self(v.try_into().unwrap()))
+        let schema_bytes: [u8; 4] = hex::decode(&value[..2 * size_of::<SchemaVersion>()])
+            .context(error::DocIDDecode)?
+            .try_into()
+            .unwrap();
+        let vs_bytes: [u8; 12] = hex::decode(&value[2 * size_of::<SchemaVersion>()..])
+            .context(error::DocIDDecode)?
+            .try_into()
+            .unwrap();
+        Ok(Self {
+            schema: SchemaVersion::from_le_bytes(schema_bytes),
+            versionstamp: Versionstamp::from(vs_bytes),
+        })
     }
 }
 
@@ -56,10 +72,14 @@ impl DB {
     pub(crate) async fn from_path(path: &str) -> Result<Self, AppError> {
         let fdb =
             foundationdb::Database::from_path(path).whatever_context("initializing database")?;
-        let s = InstanceSchema::load(&fdb).await?;
+
+        let tx = fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let s = InstanceSchema::load(&tx).await?;
         let db = Self {
             fdb,
-            schema: Arc::new(RwLock::new(s)),
+            schema: Arc::new(tokio::sync::RwLock::new(s)),
         };
 
         Ok(db)
@@ -98,21 +118,28 @@ impl DB {
         doc: rmpv::Value,
     ) -> Result<DocID, AppError> {
         let validation_result = {
-            let mut schema = self.schema.write().expect("poisoned lock");
-            let validation_result = schema.validate_doc(db, collection, &doc)?;
-            if validation_result.schema_changed {
-                schema.
-            }
-
+            let schema = self.schema.write().await;
+            schema.validate_doc(db, collection, &doc)?
         };
 
-        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
-        let kt = (KEY_PK, &Versionstamp::incomplete(0));
-        let key = subspace.pack_with_versionstamp(&kt);
+        let schema_version = if let Some(updated_collection) = validation_result.updated_collection
+        {
+            let mut schema = self.schema.write().await;
+            schema
+                .apply_schema_update(db, collection, Some(updated_collection), &self.fdb)
+                .await?
+        } else {
+            validation_result.schema_version
+        };
 
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
+
+        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
+        let kt = (KEY_PK, schema_version, &Versionstamp::incomplete(0));
+        let key = subspace.pack_with_versionstamp(&kt);
+
         let mut payload = Vec::with_capacity(64);
         rmpv::encode::write_value(&mut payload, &doc).context(error::MPVEncode {
             e: "encoding document",
@@ -130,7 +157,7 @@ impl DB {
             .whatever_context("invalid versionstamp")?;
         let versionstamp = Versionstamp::complete(versionstamp, 0);
 
-        Ok(DocID(versionstamp.as_bytes().clone()))
+        Ok(DocID::new(schema_version, versionstamp))
     }
 
     pub(crate) async fn query(
@@ -156,14 +183,16 @@ impl DB {
                 e: "streaming documents from FDB",
             })?;
             for doc in docs {
-                let (_space, _db, _collection, _pk, versionstamp) =
-                    tuple::unpack::<(String, String, String, String, Versionstamp)>(doc.key())
-                        .context(error::FdbTupleUnpack)?;
+                let (_space, _db, _collection, _pk, schema_version, versionstamp) =
+                    tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(
+                        doc.key(),
+                    )
+                    .context(error::FdbTupleUnpack)?;
                 let value =
                     rmpv::decode::read_value(&mut doc.value()).context(error::MPVDecode {
                         e: "decoding document",
                     })?;
-                let id = DocID(*versionstamp.as_bytes());
+                let id = DocID::new(schema_version, versionstamp);
                 if p.execute(&String::from(&id), &value)? {
                     query_result.push(Document { id, doc: value });
                 }
@@ -187,7 +216,7 @@ impl DB {
     ) -> Result<Option<rmpv::Value>, AppError> {
         let id = id.try_into()?;
         let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
-        let key = subspace.pack(&(KEY_PK, Versionstamp::from(id.0)));
+        let key = subspace.pack(&(KEY_PK, id.schema, id.versionstamp));
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
@@ -204,7 +233,20 @@ impl DB {
         }
     }
 
-    pub(crate) async fn add_index(
+    pub(crate) async fn create_collection(
+        &self,
+        db: &str,
+        collection: &str,
+    ) -> Result<(), AppError> {
+        let mut schema = self.schema.write().await;
+        schema.create_collection(db, collection);
+        schema
+            .apply_schema_update(db, collection, Some(CollectionSchema::default()), &self.fdb)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn create_index(
         &self,
         db: &str,
         collection: &str,

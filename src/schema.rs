@@ -6,15 +6,15 @@ use foundationdb::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use snafu::{ResultExt, whatever};
+use snafu::{OptionExt, ResultExt, whatever};
 
-use crate::error::{self, AppError};
+use crate::error::{self, AppError, FdbTransactionCommit};
 
 /*
     Key layout:
-    "d".db.collection."pk".doc_id -> [document value], where doc_id is versionstamp  | main data
-    "d".db.collection."ix".f1.f2.<...>.fn.doc_id -> null                             | secondary index over fields f1, f2, ... fn
-    "m"."schema" -> [encoded InstanceSchema]                                         | instance schema
+    "d".db.collection."pk".<doc_id> -> [document value], where <doc_id> is schema.versionstamp             | main data
+    "d".db.collection."ix".f1.f2.<...>.fn.<doc_id> -> null                                                 | secondary index over fields f1, f2, ... fn
+    "m"."schema" -> [encoded InstanceSchema]                                                               | instance schema
 */
 pub(crate) const SPACE_DATA: &'static str = "d";
 pub(crate) const SPACE_META: &'static str = "m";
@@ -25,26 +25,28 @@ pub(crate) const KEY_SCHEMA: &'static str = "schema";
 static FLD_NAME_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z][-_0-9a-zA-Z]*$").unwrap());
 
+pub(crate) type SchemaVersion = u32;
+
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct InstanceSchema {
-    version: u32,
+    version: SchemaVersion,
     schemas: HashMap<(String, String), CollectionSchema>,
 }
 
-#[derive(Serialize, Deserialize, Default, Debug)]
-struct CollectionSchema {
+#[derive(Clone, Serialize, Deserialize, Default, Debug)]
+pub(crate) struct CollectionSchema {
     fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
     indexes: Vec<IndexDef>,
 }
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Clone, Serialize, Deserialize, Debug)]
 struct IndexDef {
     name: String,
     fields: Vec<String>,
     ready: bool,
 }
 
-#[derive(Serialize, Deserialize, PartialEq, Debug)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
 enum DataType {
     Integer,
     Float,
@@ -56,8 +58,9 @@ enum DataType {
 }
 
 pub(crate) struct ValidationResult {
-    pub(crate) update_schema: Option<CollectionSchema>,
+    pub(crate) updated_collection: Option<CollectionSchema>,
     pub(crate) affected_indexes: Option<Vec<String>>,
+    pub(crate) schema_version: SchemaVersion,
 }
 
 type NewFields = Vec<(String, DataType)>;
@@ -91,22 +94,41 @@ impl InstanceSchema {
         Ok(schema)
     }
 
-    pub(crate) async fn commit_schema(
+    pub(crate) async fn apply_schema_update(
         &mut self,
-        tx: &foundationdb::Transaction,
-    ) -> Result<(), AppError> {
-        let current_schema = Self::load(tx).await?;
-        if current_schema.version > self.version {
+        db: &str,
+        collection: &str,
+        updated_collection: Option<CollectionSchema>,
+        fdb: &foundationdb::Database,
+    ) -> Result<SchemaVersion, AppError> {
+        let tx = fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let mut current_schema = Self::load(&tx).await?;
+        if current_schema.version != self.version {
             // TODO: maybe update self with loaded version and retry validation?
             error::SchemaConflict.fail()?;
         }
+        current_schema.version += 1;
+        if let Some(updated_collection) = updated_collection {
+            current_schema.schemas.insert(
+                (String::from(db), String::from(collection)),
+                updated_collection,
+            );
+        }
+
         let mut schema_bytes = Vec::new();
-        self.serialize(&mut rmp_serde::Serializer::new(&mut schema_bytes))
+        current_schema
+            .serialize(&mut rmp_serde::Serializer::new(&mut schema_bytes))
             .whatever_context("serializing schema")?;
         let key = Subspace::from_bytes(SPACE_META).pack(&(KEY_SCHEMA));
         tx.set(&key, &schema_bytes);
+        tx.commit().await.context(error::FdbTransactionCommit)?;
 
-        Ok(())
+        *self = current_schema;
+        eprintln!("schema now is {:?}", self);
+
+        Ok(self.version)
     }
 
     /// Validates document against schema.
@@ -117,7 +139,7 @@ impl InstanceSchema {
     ///
     /// Also returns list of secondary indexes that shall be updated upon insertion of the document.
     pub(crate) fn validate_doc(
-        &mut self,
+        &self,
         db: &str,
         collection: &str,
         doc: &rmpv::Value,
@@ -130,13 +152,16 @@ impl InstanceSchema {
         };
 
         let mut result = ValidationResult {
-            schema_changed: false,
+            updated_collection: None,
             affected_indexes: None,
+            schema_version: self.version,
         };
         let schema = self
             .schemas
-            .entry((String::from(db), String::from(collection)))
-            .or_insert(CollectionSchema::default());
+            .get(&(String::from(db), String::from(collection)))
+            .context(error::BadRequest {
+                e: format!("Collection {db}.{collection} does not exist"),
+            })?;
 
         let (referred_fields, new_fields) = Self::validate_object(
             doc,
@@ -145,10 +170,13 @@ impl InstanceSchema {
             Vec::with_capacity(schema.fields.len()),
             None,
         )?;
+
         if let Some(new_fields) = new_fields {
-            result.schema_changed = true;
-            schema.fields.extend(new_fields);
+            let mut updated_schema = schema.clone();
+            updated_schema.fields.extend(new_fields);
+            result.updated_collection = Some(updated_schema);
         }
+
         for field in referred_fields {
             for index in &schema.indexes {
                 if index.fields.contains(&field) {
@@ -167,6 +195,13 @@ impl InstanceSchema {
         }
 
         Ok(result)
+    }
+
+    /// creates new collection to in-memory representation of schema. Does not write schema to FDB!
+    pub(crate) fn create_collection(&mut self, db: &str, collection: &str) {
+        self.schemas
+            .entry((String::from(db), String::from(collection)))
+            .or_insert(CollectionSchema::default());
     }
 
     /// adds new index to in-memory representation of schema. Does not write schema to FDB!
