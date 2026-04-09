@@ -57,6 +57,9 @@ pub enum AppError {
     #[snafu(display("validation error: {e}"), context(suffix(false)))]
     Validation { e: String },
 
+    #[snafu(display("schema version conflict"), context(suffix(false)))]
+    SchemaConflict,
+
     #[snafu(display("failed to parse query: {e}"), context(suffix(false)))]
     QueryParse {
         e: String,
@@ -126,6 +129,11 @@ impl IntoResponse for AppError {
             AppError::Validation { e } => (
                 StatusCode::BAD_REQUEST,
                 Json(json!({"error": format!("{e}")})),
+            )
+                .into_response(),
+            AppError::SchemaConflict => (
+                StatusCode::CONFLICT,
+                Json(json!({"error": "schema version conflict, retry operation"})),
             )
                 .into_response(),
             AppError::QueryParse { e, source } => (

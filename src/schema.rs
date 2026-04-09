@@ -6,7 +6,7 @@ use foundationdb::{
 };
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
+use snafu::{ResultExt, whatever};
 
 use crate::error::{self, AppError};
 
@@ -56,8 +56,8 @@ enum DataType {
 }
 
 pub(crate) struct ValidationResult {
-    schema_changed: bool,
-    affected_indexes: Option<Vec<String>>,
+    pub(crate) update_schema: Option<CollectionSchema>,
+    pub(crate) affected_indexes: Option<Vec<String>>,
 }
 
 type NewFields = Vec<(String, DataType)>;
@@ -77,10 +77,7 @@ impl Display for DataType {
 
 impl InstanceSchema {
     /// Loads schema from FDB
-    pub(crate) async fn load(fdb: &foundationdb::Database) -> Result<Self, AppError> {
-        let tx = fdb.create_trx().context(error::Fdb {
-            e: "starting transaction",
-        })?;
+    pub(crate) async fn load(tx: &foundationdb::Transaction) -> Result<Self, AppError> {
         let key = Subspace::from_bytes(SPACE_META).pack(&(KEY_SCHEMA));
         let schema = match tx.get(&key, false).await.context(error::Fdb {
             e: "getting schema from FDB",
@@ -92,6 +89,24 @@ impl InstanceSchema {
             None => Self::default(),
         };
         Ok(schema)
+    }
+
+    pub(crate) async fn commit_schema(
+        &mut self,
+        tx: &foundationdb::Transaction,
+    ) -> Result<(), AppError> {
+        let current_schema = Self::load(tx).await?;
+        if current_schema.version > self.version {
+            // TODO: maybe update self with loaded version and retry validation?
+            error::SchemaConflict.fail()?;
+        }
+        let mut schema_bytes = Vec::new();
+        self.serialize(&mut rmp_serde::Serializer::new(&mut schema_bytes))
+            .whatever_context("serializing schema")?;
+        let key = Subspace::from_bytes(SPACE_META).pack(&(KEY_SCHEMA));
+        tx.set(&key, &schema_bytes);
+
+        Ok(())
     }
 
     /// Validates document against schema.

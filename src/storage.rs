@@ -1,13 +1,9 @@
-use std::{
-    collections::HashMap,
-    fmt::Display,
-    sync::{Arc, LazyLock, Mutex, RwLock},
-};
+use std::sync::{Arc, RwLock};
 
 use crate::{
     error::{self, AppError, MPVDecode},
     predicate::Predicate,
-    schema::{self, InstanceSchema, KEY_PK, SPACE_DATA},
+    schema::{InstanceSchema, KEY_PK, SPACE_DATA},
 };
 use foundationdb::{
     RangeOption,
@@ -101,10 +97,14 @@ impl DB {
         collection: &str,
         doc: rmpv::Value,
     ) -> Result<DocID, AppError> {
-        {
+        let validation_result = {
             let mut schema = self.schema.write().expect("poisoned lock");
-            schema.validate_doc(db, collection, &doc)?;
-        }
+            let validation_result = schema.validate_doc(db, collection, &doc)?;
+            if validation_result.schema_changed {
+                schema.
+            }
+
+        };
 
         let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
         let kt = (KEY_PK, &Versionstamp::incomplete(0));
