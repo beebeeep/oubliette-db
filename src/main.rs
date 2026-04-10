@@ -5,12 +5,12 @@ use axum::Router;
 use axum::routing::{get, patch, post, put};
 use snafu::prelude::*;
 
-mod encoding;
 mod error;
 mod http_api;
 mod predicate;
 mod schema;
 mod storage;
+mod values;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {

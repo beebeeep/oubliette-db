@@ -1,5 +1,33 @@
 use base64::prelude::*;
 
+pub(crate) fn extract_field<'a>(path: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
+    // path looks like .foo.bar.baz, split it by ".", skip 1st part
+    // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
+    // note that document may not contain fields referred by query, that is normal
+    let mut tail = value;
+    for field in path.split(".").skip(1) {
+        if let Some(v) = extract_field_entry(field, tail) {
+            tail = v;
+        } else {
+            return None;
+        }
+    }
+    Some(tail)
+}
+
+fn extract_field_entry<'a>(entry: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
+    if let rmpv::Value::Map(items) = value {
+        for (k, v) in items {
+            if let Some(s) = k.as_str() {
+                if s == entry {
+                    return Some(v);
+                }
+            }
+        }
+    }
+    None
+}
+
 pub(crate) fn json2mp(v: serde_json::Value) -> rmpv::Value {
     match v {
         serde_json::Value::Null => rmpv::Value::Nil,

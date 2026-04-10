@@ -3,7 +3,10 @@ use std::{fmt::Display, sync::Arc};
 use crate::{
     error::{self, AppError, MPVDecode},
     predicate::Predicate,
-    schema::{CollectionSchema, InstanceSchema, KEY_PK, SPACE_DATA, SchemaVersion},
+    schema::{
+        self, Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_PK,
+        SPACE_DATA, SchemaUpdate, SchemaVersion,
+    },
 };
 use foundationdb::{
     RangeOption,
@@ -124,28 +127,36 @@ impl DB {
         collection: &str,
         doc: rmpv::Value,
     ) -> Result<DocID, AppError> {
-        let validation_result = {
-            let schema = self.schema.write().await;
-            schema.validate_doc(db, collection, &doc)?
-        };
+        let schema = self.schema.read().await;
 
-        let schema_version = if let Some(updated_collection) = validation_result.updated_collection
-        {
-            let mut schema = self.schema.write().await;
-            schema
-                .apply_schema_update(db, collection, Some(updated_collection), &self.fdb)
-                .await?
-        } else {
-            validation_result.schema_version
-        };
+        let collection = Collection::from((db, collection));
+        let validation_result = schema.validate_doc(&collection, &doc)?;
+        let (schema, schema_version) =
+            if let Some(updated_collection) = validation_result.updated_collection {
+                // relock for write
+                drop(schema);
+                let mut schema = self.schema.write().await;
+                let schema_version = schema
+                    .apply_schema_update(
+                        &collection,
+                        SchemaUpdate::UpdateCollection(updated_collection),
+                        &self.fdb,
+                    )
+                    .await?;
+
+                // relock back for reading
+                drop(schema);
+                (self.schema.read().await, schema_version)
+            } else {
+                (schema, validation_result.schema_version)
+            };
 
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
 
-        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
         let kt = (KEY_PK, schema_version, &Versionstamp::incomplete(0));
-        let key = subspace.pack_with_versionstamp(&kt);
+        let key = collection.subspace().pack_with_versionstamp(&kt);
 
         let mut payload = Vec::with_capacity(64);
         rmpv::encode::write_value(&mut payload, &doc).context(error::MPVEncode {
@@ -176,13 +187,14 @@ impl DB {
     ) -> Result<Vec<Document>, AppError> {
         let p = Predicate::from_query(query).whatever_context("parsing query")?;
         let mut query_result = Vec::with_capacity(1);
+        let collection = Collection::from((db, collection));
 
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
         // TODO: implement query planner lol
         // doing fullscan instead
-        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection, KEY_PK));
+        let subspace = collection.subspace().subspace(&KEY_PK);
         let opts = RangeOption::from(&subspace);
         let mut results = tx.get_ranges(opts, false);
         while let Some(docs) = results.next().await {
@@ -246,9 +258,13 @@ impl DB {
         collection: &str,
     ) -> Result<(), AppError> {
         let mut schema = self.schema.write().await;
-        schema.create_collection(db, collection);
+
         schema
-            .apply_schema_update(db, collection, Some(CollectionSchema::default()), &self.fdb)
+            .apply_schema_update(
+                &Collection::from((db, collection)),
+                SchemaUpdate::UpdateCollection(CollectionSchema::default()),
+                &self.fdb,
+            )
             .await?;
         Ok(())
     }
@@ -257,9 +273,39 @@ impl DB {
         &self,
         db: &str,
         collection: &str,
-        fields: &str,
+        name: &str,
+        fields: Vec<IndexField>,
     ) -> Result<(), AppError> {
-        todo!()
+        let mut schema = self.schema.write().await;
+        let schema_version = schema
+            .apply_schema_update(
+                &Collection::from((db, collection)),
+                SchemaUpdate::CreateIndex((
+                    String::from(name),
+                    IndexDef {
+                        fields: fields.clone(),
+                        ready: false,
+                    },
+                )),
+                &self.fdb,
+            )
+            .await?;
+
+        self.backfill_index(db, collection, &fields, schema_version)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn backfill_index(
+        &self,
+        db: &str,
+        collection: &str,
+        fields: &[IndexField],
+        version: SchemaVersion,
+    ) -> Result<(), AppError> {
+        // TODO: make it background batched job
+        Ok(())
     }
 }
 

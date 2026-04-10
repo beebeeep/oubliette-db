@@ -1,10 +1,10 @@
 use std::{process::id, sync::Arc};
 
 use crate::{
-    encoding::{json2mp, mp2json},
     error::{self, AppError},
     predicate::Predicate,
     storage,
+    values::{json2mp, mp2json},
 };
 use axum::{
     body::Bytes,
@@ -140,13 +140,14 @@ pub(crate) async fn add_index(
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<AddIndexRequest>,
 ) -> Result<Json<AddIndexResponse>, AppError> {
-    for field in req.fields {
-        state
-            .db
-            .create_index(&db, &collection, field.as_ref())
-            .await?;
-    }
-    Ok(Json(AddIndexResponse {}))
+    // for field in req.fields {
+    //     state
+    //         .db
+    //         .create_index(&db, &collection, field.as_ref())
+    //         .await?;
+    // }
+    // Ok(Json(AddIndexResponse {}))
+    todo!()
 }
 
 pub(crate) async fn collection_update(

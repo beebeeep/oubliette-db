@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use crate::error::{self, AppError};
+use crate::{
+    error::{self, AppError},
+    values::extract_field,
+};
 use sexpression::Expression;
 use snafu::{ResultExt, whatever};
 
@@ -57,19 +60,12 @@ impl<'a> Predicate<'a> {
         r.insert(".__id", Expression::Str(id)); // always inject doc ID as a bogus field "__id"
 
         'NEXT_FIELD: for path in &self.referred_fields {
-            // path looks like .foo.bar.baz, split it by ".", skip 1st part
-            // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
-            // note that document may not contain fields referred by query, that is normal
-            let mut tail = value;
-            for field in path.split(".").skip(1) {
-                if let Some(v) = Self::get_field(field, tail) {
-                    tail = v;
-                } else {
-                    continue 'NEXT_FIELD;
-                }
-            }
+            let Some(field) = extract_field(path, value) else {
+                continue 'NEXT_FIELD;
+            };
+
             // convert value we got into Expression assuming it is scalar value
-            let tail = match tail {
+            let field = match field {
                 rmpv::Value::Boolean(b) => Expression::Bool(*b),
                 rmpv::Value::Integer(n) => Expression::Number(n.as_f64().unwrap()),
                 rmpv::Value::F32(f) => Expression::Number(*f as f64),
@@ -85,22 +81,9 @@ impl<'a> Predicate<'a> {
                     continue 'NEXT_FIELD;
                 }
             };
-            r.insert(*path, tail);
+            r.insert(*path, field);
         }
         r
-    }
-
-    fn get_field(name: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
-        if let rmpv::Value::Map(items) = value {
-            for (k, v) in items {
-                if let Some(s) = k.as_str() {
-                    if s == name {
-                        return Some(v);
-                    }
-                }
-            }
-        }
-        None
     }
 }
 
@@ -282,7 +265,7 @@ mod tests {
     use serde_json::json;
     use sexpression::Expression;
 
-    use crate::{encoding::json2mp, predicate::Predicate};
+    use crate::{predicate::Predicate, values::json2mp};
 
     #[test]
     fn referred_fields_extraction() {
