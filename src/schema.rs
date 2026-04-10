@@ -39,10 +39,13 @@ pub(crate) struct CollectionSchema {
     indexes: Vec<IndexDef>,
 }
 
+/// field name and prefix length (chars for utf-8 strings, bytes for binary strings)
+type IndexField = (String, usize);
+
 #[derive(Clone, Serialize, Deserialize, Debug)]
 struct IndexDef {
     name: String,
-    fields: Vec<String>,
+    fields: Vec<IndexField>,
     ready: bool,
 }
 
@@ -65,6 +68,12 @@ pub(crate) struct ValidationResult {
 
 type NewFields = Vec<(String, DataType)>;
 type ReferredFields = Vec<String>;
+
+impl IndexDef {
+    fn contains(&self, field: &str) -> bool {
+        self.fields.iter().any(|(idx_field, _)| idx_field == field)
+    }
+}
 
 impl Display for DataType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -179,7 +188,7 @@ impl InstanceSchema {
 
         for field in referred_fields {
             for index in &schema.indexes {
-                if index.fields.contains(&field) {
+                if index.contains(&field) {
                     let n = index.name.clone();
                     result.affected_indexes = match result.affected_indexes {
                         Some(mut a) => {

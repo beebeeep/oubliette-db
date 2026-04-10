@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{fmt::Display, sync::Arc};
 
 use crate::{
     error::{self, AppError, MPVDecode},
@@ -42,6 +42,12 @@ impl From<&DocID> for String {
         let mut s = hex::encode(d.schema.to_le_bytes());
         s.push_str(&hex::encode(d.versionstamp.as_bytes()));
         s
+    }
+}
+
+impl Display for DocID {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", String::from(self))
     }
 }
 
@@ -176,7 +182,7 @@ impl DB {
         })?;
         // TODO: implement query planner lol
         // doing fullscan instead
-        let subspace = Subspace::all().subspace(&(db, collection, KEY_PK));
+        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection, KEY_PK));
         let opts = RangeOption::from(&subspace);
         let mut results = tx.get_ranges(opts, false);
         while let Some(docs) = results.next().await {
@@ -251,7 +257,7 @@ impl DB {
         &self,
         db: &str,
         collection: &str,
-        field: &str,
+        fields: &str,
     ) -> Result<(), AppError> {
         todo!()
     }
