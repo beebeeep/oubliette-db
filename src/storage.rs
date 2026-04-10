@@ -13,6 +13,7 @@ use foundationdb::{
 use futures::StreamExt;
 use snafu::ResultExt;
 
+#[derive(Debug)]
 pub(crate) struct DocID {
     schema: SchemaVersion,
     versionstamp: Versionstamp,
@@ -48,7 +49,7 @@ impl TryFrom<&str> for DocID {
     type Error = AppError;
 
     fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.len() != 2 * size_of::<SchemaVersion>() + 12 {
+        if value.len() != 2 * (size_of::<SchemaVersion>() + 12) {
             return Err(AppError::DocIDDecode {
                 source: hex::FromHexError::InvalidStringLength,
             });
@@ -267,4 +268,15 @@ fn dump_key(key: &[u8]) -> String {
         }
     }
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::storage::DocID;
+
+    #[test]
+    fn test_doc_id() {
+        let d = DocID::try_from("04000000000000003280028900000000").expect("failed to parse docID");
+        assert_eq!(d.schema, 4);
+    }
 }

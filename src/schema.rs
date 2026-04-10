@@ -319,6 +319,7 @@ mod tests {
     #[test]
     fn doc_validation() {
         let mut schema = InstanceSchema::default();
+        let coll = (String::from("testdb"), String::from("testcol"));
         schema.add_index(
             "testdb",
             "testcol",
@@ -337,7 +338,10 @@ mod tests {
         let r = schema
             .validate_doc("testdb", "testcol", &j(r#"{"foo": 137}"#))
             .unwrap();
-        assert!(r.schema_changed);
+        schema.schemas.insert(
+            coll.clone(),
+            r.updated_collection.expect("collection update expected"),
+        );
         assert_eq!(
             r.affected_indexes,
             Some(vec![
@@ -355,7 +359,10 @@ mod tests {
         let r = schema
             .validate_doc("testdb", "testcol", &j(r#"{"bar": {"baz": "chlos"}}"#))
             .unwrap();
-        assert!(r.schema_changed);
+        schema.schemas.insert(
+            coll.clone(),
+            r.updated_collection.expect("collection update expected"),
+        );
         assert_eq!(
             r.affected_indexes,
             Some(vec![String::from("idx_foo_barbaz")])
@@ -378,7 +385,10 @@ mod tests {
                 &j(r#"{"foo": 138, "bar": {"baq": 12.3}}"#),
             )
             .unwrap();
-        assert!(r.schema_changed);
+        schema.schemas.insert(
+            coll.clone(),
+            r.updated_collection.expect("collection update expected"),
+        );
 
         let r = schema
             .validate_doc(
@@ -387,7 +397,7 @@ mod tests {
                 &j(r#"{"foo": 139, "bar": {"baz": "CHLOS", "baq": 12.3}}"#),
             )
             .unwrap();
-        assert!(!r.schema_changed);
+        assert!(r.updated_collection.is_none());
         assert_eq!(
             r.affected_indexes,
             Some(vec![
@@ -404,7 +414,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(r.schema_changed);
+        schema.schemas.insert(
+            coll.clone(),
+            r.updated_collection.expect("collection update expected"),
+        );
         assert!(r.affected_indexes.is_none());
 
         let dbs = schema
