@@ -31,18 +31,18 @@ pub(crate) struct Collection {
 
 #[derive(Serialize, Deserialize, Debug, Default)]
 pub(crate) struct InstanceSchema {
-    version: SchemaVersion,
-    schemas: HashMap<Collection, CollectionSchema>,
+    pub(crate) version: SchemaVersion,
+    pub(crate) collections: HashMap<Collection, CollectionSchema>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub(crate) struct CollectionSchema {
-    fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
-    indexes: HashMap<String, IndexDef>,
+    pub(crate) fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
+    pub(crate) indexes: HashMap<String, IndexDef>,
 }
 
 /// field name and prefix length (chars for utf-8 strings, bytes for binary strings)
-pub(crate) type IndexField = (String, usize);
+pub(crate) type IndexField = (String, Option<usize>);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub(crate) struct IndexDef {
@@ -69,7 +69,6 @@ pub(crate) enum SchemaUpdate {
 pub(crate) struct ValidationResult {
     pub(crate) updated_collection: Option<CollectionSchema>,
     pub(crate) affected_indexes: Option<Vec<String>>,
-    pub(crate) schema_version: SchemaVersion,
 }
 
 type NewFields = Vec<(String, DataType)>;
@@ -135,7 +134,7 @@ impl InstanceSchema {
         collection: &Collection,
         schema_update: SchemaUpdate,
         fdb: &foundationdb::Database,
-    ) -> Result<SchemaVersion, AppError> {
+    ) -> Result<(), AppError> {
         let tx = fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
@@ -149,13 +148,13 @@ impl InstanceSchema {
 
         match schema_update {
             SchemaUpdate::UpdateCollection(col) => {
-                current_schema.schemas.insert(collection.clone(), col);
+                current_schema.collections.insert(collection.clone(), col);
             }
             SchemaUpdate::CreateIndex((name, mut index)) => {
                 index.ready = false;
                 let col =
                     current_schema
-                        .schemas
+                        .collections
                         .get_mut(collection)
                         .context(error::BadRequest {
                             e: "collection does not exist",
@@ -181,7 +180,7 @@ impl InstanceSchema {
 
         *self = current_schema;
 
-        Ok(self.version)
+        Ok(())
     }
 
     /// Validates document against schema.
@@ -206,28 +205,30 @@ impl InstanceSchema {
         let mut result = ValidationResult {
             updated_collection: None,
             affected_indexes: None,
-            schema_version: self.version,
         };
-        let schema = self.schemas.get(collection).context(error::BadRequest {
-            e: format!("Collection {collection} does not exist"),
-        })?;
+        let coll = self
+            .collections
+            .get(collection)
+            .context(error::BadRequest {
+                e: format!("Collection {collection} does not exist"),
+            })?;
 
         let (referred_fields, new_fields) = Self::validate_object(
             doc,
             String::from(""),
-            &schema.fields,
-            Vec::with_capacity(schema.fields.len()),
+            &coll.fields,
+            Vec::with_capacity(coll.fields.len()),
             None,
         )?;
 
         if let Some(new_fields) = new_fields {
-            let mut updated_schema = schema.clone();
+            let mut updated_schema = coll.clone();
             updated_schema.fields.extend(new_fields);
             result.updated_collection = Some(updated_schema);
         }
 
         for field in referred_fields {
-            for (index_name, index) in &schema.indexes {
+            for (index_name, index) in &coll.indexes {
                 if index.contains(&field) {
                     let n = index_name.clone();
                     result.affected_indexes = match result.affected_indexes {
@@ -346,7 +347,7 @@ mod tests {
         let coll = Collection::from(("testdb", "testcol"));
         let mut schema = InstanceSchema {
             version: 0,
-            schemas: HashMap::from([(
+            collections: HashMap::from([(
                 coll.clone(),
                 CollectionSchema {
                     fields: HashMap::new(),
@@ -376,7 +377,7 @@ mod tests {
         assert!(schema.validate_doc(&coll, &j("137")).is_err());
 
         let r = schema.validate_doc(&coll, &j(r#"{"foo": 137}"#)).unwrap();
-        schema.schemas.insert(
+        schema.collections.insert(
             coll.clone(),
             r.updated_collection.expect("collection update expected"),
         );
@@ -396,7 +397,7 @@ mod tests {
         let r = schema
             .validate_doc(&coll, &j(r#"{"bar": {"baz": "chlos"}}"#))
             .unwrap();
-        schema.schemas.insert(
+        schema.collections.insert(
             coll.clone(),
             r.updated_collection.expect("collection update expected"),
         );
@@ -414,7 +415,7 @@ mod tests {
         let r = schema
             .validate_doc(&coll, &j(r#"{"foo": 138, "bar": {"baq": 12.3}}"#))
             .unwrap();
-        schema.schemas.insert(
+        schema.collections.insert(
             coll.clone(),
             r.updated_collection.expect("collection update expected"),
         );
@@ -438,13 +439,13 @@ mod tests {
             .validate_doc(&coll, &j(r#"{"bar": {"baw": {"foo": true}}}"#))
             .unwrap();
 
-        schema.schemas.insert(
+        schema.collections.insert(
             coll.clone(),
             r.updated_collection.expect("collection update expected"),
         );
         assert!(r.affected_indexes.is_none());
 
-        let dbs = schema.schemas.get(&coll).unwrap();
+        let dbs = schema.collections.get(&coll).unwrap();
         assert_eq!(dbs.fields.len(), 4);
         assert_eq!(dbs.fields.get(".foo"), Some(&DataType::Integer));
         assert_eq!(dbs.fields.get(".bar.baz"), Some(&DataType::String));

@@ -26,14 +26,17 @@ async fn main() -> Result<(), AppError> {
             "/{db}/{collection}/{doc_id}",
             get(http_api::collection_get_doc),
         )
+        .route("/{db}/{collection}", post(http_api::collection_query))
+        .route("/{db}/{collection}", put(http_api::collection_set))
+        .route("/{db}/{collection}", patch(http_api::collection_update))
         .route(
             "/_manage/{db}/{collection}/create",
             post(http_api::create_collection),
         )
-        .route("/{db}/{collection}", post(http_api::collection_query))
-        .route("/{db}/{collection}", put(http_api::collection_set))
-        .route("/{db}/{collection}", patch(http_api::collection_update))
-        .route("/indexes/{db}/{collection}", put(http_api::add_index))
+        .route(
+            "/_manage/{db}/{collection}/create_index",
+            post(http_api::add_index),
+        )
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("localhost:4800")
         .await

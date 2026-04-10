@@ -1,8 +1,7 @@
-use std::{process::id, sync::Arc};
+use std::sync::Arc;
 
 use crate::{
-    error::{self, AppError},
-    predicate::Predicate,
+    error::AppError,
     storage,
     values::{json2mp, mp2json},
 };
@@ -11,7 +10,6 @@ use axum::{
     extract::{Json, Path, State},
 };
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
@@ -40,8 +38,15 @@ pub struct SetResponse {
 }
 
 #[derive(Deserialize)]
+pub struct IndexField {
+    field: Box<str>,
+    prefix_length: Option<usize>,
+}
+
+#[derive(Deserialize)]
 pub struct AddIndexRequest {
-    fields: Vec<Box<str>>,
+    name: Box<str>,
+    fields: Vec<IndexField>,
 }
 
 #[derive(Serialize)]
@@ -140,14 +145,16 @@ pub(crate) async fn add_index(
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<AddIndexRequest>,
 ) -> Result<Json<AddIndexResponse>, AppError> {
-    // for field in req.fields {
-    //     state
-    //         .db
-    //         .create_index(&db, &collection, field.as_ref())
-    //         .await?;
-    // }
-    // Ok(Json(AddIndexResponse {}))
-    todo!()
+    let fields = req
+        .fields
+        .into_iter()
+        .map(|f| (f.field.into_string(), f.prefix_length))
+        .collect();
+    state
+        .db
+        .create_index(&db, &collection, &req.name, fields)
+        .await?;
+    Ok(Json(AddIndexResponse {}))
 }
 
 pub(crate) async fn collection_update(

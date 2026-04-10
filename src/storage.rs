@@ -1,12 +1,13 @@
-use std::{fmt::Display, sync::Arc};
+use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use crate::{
     error::{self, AppError, MPVDecode},
     predicate::Predicate,
     schema::{
-        self, Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_PK,
+        Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
         SPACE_DATA, SchemaUpdate, SchemaVersion,
     },
+    values,
 };
 use foundationdb::{
     RangeOption,
@@ -131,31 +132,35 @@ impl DB {
 
         let collection = Collection::from((db, collection));
         let validation_result = schema.validate_doc(&collection, &doc)?;
-        let (schema, schema_version) =
-            if let Some(updated_collection) = validation_result.updated_collection {
-                // relock for write
-                drop(schema);
-                let mut schema = self.schema.write().await;
-                let schema_version = schema
-                    .apply_schema_update(
-                        &collection,
-                        SchemaUpdate::UpdateCollection(updated_collection),
-                        &self.fdb,
-                    )
-                    .await?;
+        let schema = if let Some(updated_collection) = validation_result.updated_collection {
+            // relock for write
+            drop(schema);
+            let mut schema = self.schema.write().await;
+            schema
+                .apply_schema_update(
+                    &collection,
+                    SchemaUpdate::UpdateCollection(updated_collection),
+                    &self.fdb,
+                )
+                .await?;
 
-                // relock back for reading
-                drop(schema);
-                (self.schema.read().await, schema_version)
-            } else {
-                (schema, validation_result.schema_version)
-            };
+            // relock back for reading
+            drop(schema);
+            self.schema.read().await
+        } else {
+            schema
+        };
 
+        let indexes = &schema
+            .collections
+            .get(&collection)
+            .expect("collection should exist")
+            .indexes;
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
 
-        let kt = (KEY_PK, schema_version, &Versionstamp::incomplete(0));
+        let kt = (KEY_PK, schema.version, &Versionstamp::incomplete(0));
         let key = collection.subspace().pack_with_versionstamp(&kt);
 
         let mut payload = Vec::with_capacity(64);
@@ -163,8 +168,19 @@ impl DB {
             e: "encoding document",
         })?;
         tx.atomic_op(&key, &payload, MutationType::SetVersionstampedKey);
-        let versiontstamp = tx.get_versionstamp();
 
+        if let Some(affected_indexes) = validation_result.affected_indexes {
+            Self::write_indexes(
+                &tx,
+                schema.version,
+                &collection,
+                indexes,
+                affected_indexes,
+                &doc,
+            )?;
+        }
+
+        let versiontstamp = tx.get_versionstamp();
         let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
         let versionstamp = versiontstamp.await.context(error::Fdb {
             e: "getting versionstamp",
@@ -175,7 +191,62 @@ impl DB {
             .whatever_context("invalid versionstamp")?;
         let versionstamp = Versionstamp::complete(versionstamp, 0);
 
-        Ok(DocID::new(schema_version, versionstamp))
+        Ok(DocID::new(schema.version, versionstamp))
+    }
+
+    fn write_indexes(
+        tx: &foundationdb::Transaction,
+        schema_version: SchemaVersion,
+        collection: &Collection,
+        indexes: &HashMap<String, IndexDef>,
+        affected_indexes: Vec<String>,
+        doc: &rmpv::Value,
+    ) -> Result<(), AppError> {
+        'NEXT_INDEX: for index in affected_indexes {
+            let mut idx_subspace = collection.subspace().subspace(&(&KEY_INDEX, &index));
+            let index_def = indexes.get(&index).expect("index should exist");
+            for (field, prefix_len) in &index_def.fields {
+                let Some(value) = values::extract_field(&field, doc) else {
+                    continue 'NEXT_INDEX;
+                };
+                match value {
+                    rmpv::Value::Boolean(b) => {
+                        idx_subspace = idx_subspace.subspace(b);
+                    }
+                    rmpv::Value::F32(f) => {
+                        idx_subspace = idx_subspace.subspace(f);
+                    }
+                    rmpv::Value::F64(f) => {
+                        idx_subspace = idx_subspace.subspace(f);
+                    }
+                    rmpv::Value::Integer(n) => {
+                        if let Some(n) = n.as_u64() {
+                            idx_subspace = idx_subspace.subspace(&n);
+                        }
+                        if let Some(n) = n.as_i64() {
+                            idx_subspace = idx_subspace.subspace(&n);
+                        }
+                    }
+                    rmpv::Value::String(s) => {
+                        if let Some(mut s) = s.as_str() {
+                            if let Some(prefix_len) = prefix_len {
+                                s = &s[..s.floor_char_boundary(*prefix_len)]
+                            }
+                            idx_subspace = idx_subspace.subspace(&s);
+                        } else {
+                            continue 'NEXT_INDEX;
+                        }
+                    }
+                    _ => {
+                        continue 'NEXT_INDEX;
+                    }
+                };
+            }
+            let key = idx_subspace
+                .pack_with_versionstamp(&(schema_version, &Versionstamp::incomplete(0)));
+            tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
+        }
+        Ok(())
     }
 
     pub(crate) async fn query(
@@ -277,7 +348,7 @@ impl DB {
         fields: Vec<IndexField>,
     ) -> Result<(), AppError> {
         let mut schema = self.schema.write().await;
-        let schema_version = schema
+        schema
             .apply_schema_update(
                 &Collection::from((db, collection)),
                 SchemaUpdate::CreateIndex((
@@ -291,7 +362,7 @@ impl DB {
             )
             .await?;
 
-        self.backfill_index(db, collection, &fields, schema_version)
+        self.backfill_index(db, collection, &fields, schema.version)
             .await?;
 
         Ok(())
