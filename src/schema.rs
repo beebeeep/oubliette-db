@@ -355,7 +355,7 @@ mod tests {
                         (
                             String::from("idx_foo"),
                             IndexDef {
-                                fields: vec![(String::from(".foo"), 0)],
+                                fields: vec![(String::from(".foo"), Some(0))],
                                 ready: true,
                             },
                         ),
@@ -363,8 +363,8 @@ mod tests {
                             String::from("idx_foo_barbaz"),
                             IndexDef {
                                 fields: vec![
-                                    (String::from(".foo"), 0),
-                                    (String::from(".bar.baz"), 0),
+                                    (String::from(".foo"), Some(0)),
+                                    (String::from(".bar.baz"), Some(0)),
                                 ],
                                 ready: true,
                             },

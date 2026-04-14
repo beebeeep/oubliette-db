@@ -1,15 +1,19 @@
 use rmpv::Value;
+use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
 
 use crate::error::{self, AppError};
 
+#[derive(Clone, PartialEq, Debug)]
 enum Expression {
-    And(Box<Expression>, Box<Expression>),
-    Or(Box<Expression>, Box<Expression>),
+    And(Vec<Expression>),
+    Or(Vec<Expression>),
     Not(Box<Expression>),
     Atomic(Predicate),
+    Empty,
 }
 
+#[derive(Clone, PartialEq, Debug)]
 enum Predicate {
     Eq(String, Value),
     Gt(String, Value),
@@ -17,10 +21,192 @@ enum Predicate {
     In(String, Vec<Value>),
 }
 
-impl Expression {
-    fn from_query(query: &str) -> Result<Self, AppError> {
-        let (expression, _) = sexpression::read(query).context(error::QueryParse {
+impl TryFrom<&sexpression::Expression<'_>> for Expression {
+    type Error = AppError;
+    fn try_from(sexpr: &sexpression::Expression) -> Result<Self, Self::Error> {
+        let Sexpr::List(list) = sexpr else {
+            error::BadRequest {
+                e: "query expression must be list",
+            }
+            .fail()?
+        };
+        match list.get(0) {
+            Some(Sexpr::Symbol(op)) => match *op {
+                "and" => {
+                    assert_longer(&list, 2)?;
+                    let mut v = Vec::with_capacity(list.len() - 1);
+                    for e in list.iter().skip(1) {
+                        v.push(Self::try_from(e)?);
+                    }
+                    Ok(Self::And(v))
+                }
+                "or" => {
+                    assert_longer(&list, 2)?;
+                    let mut v = Vec::with_capacity(list.len() - 1);
+                    for e in list.iter().skip(1) {
+                        v.push(Self::try_from(e)?);
+                    }
+                    Ok(Self::Or(v))
+                }
+                "not" => {
+                    assert_len(&list, 2)?;
+                    Ok(Self::Not(Box::new(Self::try_from(&list[1])?)))
+                }
+                "eq" => {
+                    assert_len(&list, 3)?;
+                    let rhs = Self::extract_field_ref(&list[1])?;
+                    let lhs = Self::extract_constant(&list[2])?;
+                    Ok(Self::Atomic(Predicate::Eq(rhs, lhs)))
+                }
+                "gt" => {
+                    assert_len(&list, 3)?;
+                    let rhs = Self::extract_field_ref(&list[1])?;
+                    let lhs = Self::extract_constant(&list[2])?;
+                    Ok(Self::Atomic(Predicate::Gt(rhs, lhs)))
+                }
+                "ge" => {
+                    assert_len(&list, 3)?;
+                    let rhs = Self::extract_field_ref(&list[1])?;
+                    let lhs = Self::extract_constant(&list[2])?;
+                    Ok(Self::Or(vec![
+                        Self::Atomic(Predicate::Gt(rhs.clone(), lhs.clone())),
+                        Self::Atomic(Predicate::Eq(rhs, lhs)),
+                    ]))
+                }
+                "lt" => {
+                    assert_len(&list, 3)?;
+                    let rhs = Self::extract_field_ref(&list[1])?;
+                    let lhs = Self::extract_constant(&list[2])?;
+                    Ok(Self::Atomic(Predicate::Lt(rhs, lhs)))
+                }
+                "le" => {
+                    assert_len(&list, 3)?;
+                    let rhs = Self::extract_field_ref(&list[1])?;
+                    let lhs = Self::extract_constant(&list[2])?;
+                    Ok(Self::Or(vec![
+                        Self::Atomic(Predicate::Lt(rhs.clone(), lhs.clone())),
+                        Self::Atomic(Predicate::Eq(rhs, lhs)),
+                    ]))
+                }
+                "in" => {
+                    assert_longer(&list, 2)?;
+                    let rhs = Self::extract_field_ref(&list[1])?;
+                    let mut lhs = Vec::with_capacity(list.len() - 2);
+                    for v in list.iter().skip(2) {
+                        lhs.push(Self::extract_constant(v)?);
+                    }
+
+                    Ok(Self::Atomic(Predicate::In(rhs, lhs)))
+                }
+                op => error::BadRequest {
+                    e: format!("unknown operator {op}"),
+                }
+                .fail()?,
+            },
+            Some(v) => error::BadRequest {
+                e: format!("unexpected token {v:?}: predicate must start with operator"),
+            }
+            .fail()?,
+            None => Ok(Self::Empty),
+        }
+    }
+}
+
+impl TryFrom<&str> for Expression {
+    type Error = AppError;
+
+    fn try_from(query: &str) -> Result<Self, Self::Error> {
+        let (expr, _) = sexpression::read(query).context(error::QueryParse {
             e: "failed to parse query",
         })?;
+        let Sexpr::List(_) = expr else {
+            error::BadRequest {
+                e: "query must be list",
+            }
+            .fail()?
+        };
+        Self::try_from(&expr)
+    }
+}
+
+impl Expression {
+    fn extract_field_ref(sexpr: &Sexpr) -> Result<String, AppError> {
+        let Sexpr::Symbol(fld) = sexpr else {
+            error::BadRequest {
+                e: "field name expected, got {sexpr:?}",
+            }
+            .fail()?
+        };
+        if !fld.starts_with(".") {
+            error::BadRequest {
+                e: "field name should start with dot, got {fld}",
+            }
+            .fail()?
+        }
+        Ok(String::from(*fld))
+    }
+
+    fn extract_constant(sexpr: &Sexpr) -> Result<Value, AppError> {
+        match sexpr {
+            Sexpr::Number(n) => {
+                if n.fract() == 0.0 {
+                    Ok(rmpv::Value::from(*n as i64))
+                } else {
+                    Ok(rmpv::Value::from(*n))
+                }
+            }
+            Sexpr::Bool(b) => Ok(rmpv::Value::from(*b)),
+            Sexpr::Str(s) => Ok(rmpv::Value::from(*s)),
+            v => error::BadRequest {
+                e: format!("constant expected, got {v:?}"),
+            }
+            .fail()?,
+        }
+    }
+}
+
+fn assert_longer(v: &[Sexpr], len: usize) -> Result<(), AppError> {
+    if v.len() <= len {
+        error::BadRequest {
+            e: format!("invalid length of expression {v:?}: more than {len} expected"),
+        }
+        .fail()?
+    }
+    Ok(())
+}
+
+fn assert_len(v: &[Sexpr], len: usize) -> Result<(), AppError> {
+    if v.len() != len {
+        error::BadRequest {
+            e: format!("invalid length of expression {v:?}: {len} expected"),
+        }
+        .fail()?
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::planner::{Expression, Predicate};
+
+    #[test]
+    fn parsing() {
+        let p = Expression::try_from("(eq .foo 137)").unwrap();
+        assert_eq!(
+            p,
+            Expression::Atomic(Predicate::Eq(String::from(".foo"), rmpv::Value::from(137)))
+        );
+
+        let p = Expression::try_from(r#"(and (eq .foo 137) (eq .bar "chlos"))"#).unwrap();
+        assert_eq!(
+            p,
+            Expression::And(vec![
+                Expression::Atomic(Predicate::Eq(String::from(".foo"), rmpv::Value::from(137))),
+                Expression::Atomic(Predicate::Eq(
+                    String::from(".bar"),
+                    rmpv::Value::from("chlos")
+                )),
+            ])
+        );
     }
 }
