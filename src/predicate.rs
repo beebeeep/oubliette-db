@@ -12,15 +12,6 @@ pub(crate) struct Predicate<'a> {
     expression: sexpression::Expression<'a>,
 }
 
-enum IndexOps {
-    Equal,
-    InSet,
-    Greater,
-    GreaterE,
-    Less,
-    LessE,
-}
-
 impl<'a> Predicate<'a> {
     pub(crate) fn from_query(query: &'a str) -> Result<Self, AppError> {
         let (expression, _) = sexpression::read(query).context(error::QueryParse {

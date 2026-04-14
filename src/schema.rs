@@ -41,7 +41,7 @@ pub(crate) struct CollectionSchema {
     pub(crate) indexes: HashMap<String, IndexDef>,
 }
 
-/// field name and prefix length (chars for utf-8 strings, bytes for binary strings)
+/// field name and prefix length in bytes (utf-8 strings are truncated to closest char boundary)
 pub(crate) type IndexField = (String, Option<usize>);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]

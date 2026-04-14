@@ -7,6 +7,7 @@ use snafu::prelude::*;
 
 mod error;
 mod http_api;
+mod planner;
 mod predicate;
 mod schema;
 mod storage;
