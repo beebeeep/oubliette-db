@@ -2,7 +2,10 @@ use rmpv::Value;
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
 
-use crate::error::{self, AppError};
+use crate::{
+    error::{self, AppError},
+    schema::{CollectionSchema, IndexDef},
+};
 
 #[derive(Clone, PartialEq, Debug)]
 enum Expression {
@@ -14,11 +17,18 @@ enum Expression {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-enum Predicate {
-    Eq(String, Value),
-    Gt(String, Value),
-    Lt(String, Value),
-    In(String, Vec<Value>),
+enum Operator {
+    Eq(Value),
+    Gt(Value),
+    Lt(Value),
+    In(Vec<Value>),
+}
+
+#[derive(Clone, PartialEq, Debug)]
+pub struct Predicate {
+    fld: String,
+    op: Operator,
+    idx: Option<String>,
 }
 
 impl TryFrom<&sexpression::Expression<'_>> for Expression {
@@ -54,49 +64,81 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                 }
                 "eq" => {
                     assert_len(&list, 3)?;
-                    let rhs = Self::extract_field_ref(&list[1])?;
-                    let lhs = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate::Eq(rhs, lhs)))
+                    let fld = Self::extract_field_ref(&list[1])?;
+                    let arg = Self::extract_constant(&list[2])?;
+                    Ok(Self::Atomic(Predicate {
+                        fld,
+                        op: Operator::Eq(arg),
+                        idx: None,
+                    }))
                 }
                 "gt" => {
                     assert_len(&list, 3)?;
-                    let rhs = Self::extract_field_ref(&list[1])?;
-                    let lhs = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate::Gt(rhs, lhs)))
+                    let fld = Self::extract_field_ref(&list[1])?;
+                    let arg = Self::extract_constant(&list[2])?;
+                    Ok(Self::Atomic(Predicate {
+                        fld,
+                        op: Operator::Gt(arg),
+                        idx: None,
+                    }))
                 }
                 "ge" => {
                     assert_len(&list, 3)?;
-                    let rhs = Self::extract_field_ref(&list[1])?;
-                    let lhs = Self::extract_constant(&list[2])?;
+                    let fld = Self::extract_field_ref(&list[1])?;
+                    let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Or(vec![
-                        Self::Atomic(Predicate::Gt(rhs.clone(), lhs.clone())),
-                        Self::Atomic(Predicate::Eq(rhs, lhs)),
+                        Self::Atomic(Predicate {
+                            fld: fld.clone(),
+                            op: Operator::Gt(arg.clone()),
+                            idx: None,
+                        }),
+                        Self::Atomic(Predicate {
+                            fld,
+                            op: Operator::Eq(arg),
+                            idx: None,
+                        }),
                     ]))
                 }
                 "lt" => {
                     assert_len(&list, 3)?;
-                    let rhs = Self::extract_field_ref(&list[1])?;
-                    let lhs = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate::Lt(rhs, lhs)))
+                    let fld = Self::extract_field_ref(&list[1])?;
+                    let arg = Self::extract_constant(&list[2])?;
+                    Ok(Self::Atomic(Predicate {
+                        fld,
+                        op: Operator::Lt(arg),
+                        idx: None,
+                    }))
                 }
                 "le" => {
                     assert_len(&list, 3)?;
-                    let rhs = Self::extract_field_ref(&list[1])?;
-                    let lhs = Self::extract_constant(&list[2])?;
+                    let fld = Self::extract_field_ref(&list[1])?;
+                    let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Or(vec![
-                        Self::Atomic(Predicate::Lt(rhs.clone(), lhs.clone())),
-                        Self::Atomic(Predicate::Eq(rhs, lhs)),
+                        Self::Atomic(Predicate {
+                            fld: fld.clone(),
+                            op: Operator::Lt(arg.clone()),
+                            idx: None,
+                        }),
+                        Self::Atomic(Predicate {
+                            fld,
+                            op: Operator::Eq(arg),
+                            idx: None,
+                        }),
                     ]))
                 }
                 "in" => {
                     assert_longer(&list, 2)?;
-                    let rhs = Self::extract_field_ref(&list[1])?;
-                    let mut lhs = Vec::with_capacity(list.len() - 2);
+                    let fld = Self::extract_field_ref(&list[1])?;
+                    let mut arg = Vec::with_capacity(list.len() - 2);
                     for v in list.iter().skip(2) {
-                        lhs.push(Self::extract_constant(v)?);
+                        arg.push(Self::extract_constant(v)?);
                     }
 
-                    Ok(Self::Atomic(Predicate::In(rhs, lhs)))
+                    Ok(Self::Atomic(Predicate {
+                        fld,
+                        op: Operator::In(arg),
+                        idx: None,
+                    }))
                 }
                 op => error::BadRequest {
                     e: format!("unknown operator {op}"),
@@ -163,6 +205,43 @@ impl Expression {
             .fail()?,
         }
     }
+
+    fn hydrate_indexes(&mut self, schema: &CollectionSchema) {
+        match self {
+            Expression::And(expressions) => {
+                expressions
+                    .iter_mut()
+                    .for_each(|e| e.hydrate_indexes(schema));
+            }
+            Expression::Or(expressions) => {
+                expressions
+                    .iter_mut()
+                    .for_each(|e| e.hydrate_indexes(schema));
+            }
+            Expression::Not(expression) => {
+                expression.hydrate_indexes(schema);
+            }
+            Expression::Atomic(predicate) => {
+                for (index, def) in schema.indexes.iter() {
+                    if def.ready && def.fields[0].0 == predicate.fld {
+                        predicate.idx = Some(index.clone());
+                        break;
+                    }
+                }
+            }
+            Expression::Empty => {}
+        }
+    }
+
+    fn is_sargable(&self) -> bool {
+        match self {
+            Expression::And(expressions) => expressions.iter().any(|e| e.is_sargable()),
+            Expression::Or(expressions) => expressions.iter().all(|e| e.is_sargable()),
+            Expression::Not(_) => false,
+            Expression::Empty => true,
+            Expression::Atomic(predicate) => predicate.idx.is_some(),
+        }
+    }
 }
 
 fn assert_longer(v: &[Sexpr], len: usize) -> Result<(), AppError> {
@@ -187,22 +266,22 @@ fn assert_len(v: &[Sexpr], len: usize) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::planner::{Expression, Predicate};
+    use crate::planner::{Expression, Operator};
 
     #[test]
     fn parsing() {
         let p = Expression::try_from("(eq .foo 137)").unwrap();
         assert_eq!(
             p,
-            Expression::Atomic(Predicate::Eq(String::from(".foo"), rmpv::Value::from(137)))
+            Expression::Atomic(Operator::Eq(String::from(".foo"), rmpv::Value::from(137)))
         );
 
         let p = Expression::try_from(r#"(and (eq .foo 137) (eq .bar "chlos"))"#).unwrap();
         assert_eq!(
             p,
             Expression::And(vec![
-                Expression::Atomic(Predicate::Eq(String::from(".foo"), rmpv::Value::from(137))),
-                Expression::Atomic(Predicate::Eq(
+                Expression::Atomic(Operator::Eq(String::from(".foo"), rmpv::Value::from(137))),
+                Expression::Atomic(Operator::Eq(
                     String::from(".bar"),
                     rmpv::Value::from("chlos")
                 )),
