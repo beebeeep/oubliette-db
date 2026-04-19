@@ -257,7 +257,6 @@ impl DB {
         query: &str,
         limit: Option<usize>,
     ) -> Result<Vec<Document>, AppError> {
-        let p = Predicate::from_query(query).whatever_context("parsing query")?;
         let mut query_result = Vec::with_capacity(1);
         let collection = Collection::from((db, collection));
         let schema = self.schema.read().await;
@@ -265,8 +264,6 @@ impl DB {
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
-        // TODO: implement query planner lol
-        // doing fullscan instead
         let Some(coll_schema) = schema.collections.get(&collection) else {
             error::BadRequest {
                 e: "unknown collection",
@@ -274,6 +271,19 @@ impl DB {
             .fail()?
         };
         let plan = Plan::from_query(&collection, coll_schema, query)?;
+        let mut result = plan.execute(&tx);
+        while let Some(doc) = result.next().await {
+            query_result.push(doc?);
+            if let Some(limit) = limit
+                && query_result.len() > limit
+            {
+                break;
+            }
+        }
+        Ok(query_result)
+        /*
+        // TODO: implement query planner lol
+        // doing fullscan instead
         let subspace = collection.subspace().subspace(&KEY_PK);
         let opts = RangeOption::from(&subspace);
         let mut results = tx.get_ranges(opts, false);
@@ -304,6 +314,7 @@ impl DB {
         }
 
         Ok(query_result)
+        */
     }
 
     /// queries single doc by id

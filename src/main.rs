@@ -6,6 +6,7 @@ use axum::routing::{get, patch, post, put};
 use snafu::prelude::*;
 
 mod error;
+mod expression;
 mod http_api;
 mod planner;
 mod predicate;

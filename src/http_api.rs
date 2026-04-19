@@ -94,6 +94,7 @@ pub(crate) async fn collection_get_doc(
     }))
 }
 
+#[axum::debug_handler]
 pub(crate) async fn collection_query(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
