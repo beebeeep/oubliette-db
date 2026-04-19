@@ -1,10 +1,19 @@
+use std::future;
+
+use foundationdb::{
+    FdbError, RangeOption, TransactError, Transaction, TransactionCancelled,
+    future::FdbValues,
+    tuple::{Subspace, Versionstamp},
+};
+use futures::{Stream, StreamExt, TryStreamExt, future::Either, stream};
 use rmpv::Value;
 use sexpression::Expression as Sexpr;
-use snafu::ResultExt;
+use snafu::{ResultExt, whatever};
 
 use crate::{
     error::{self, AppError},
-    schema::{CollectionSchema, IndexDef},
+    schema::{Collection, CollectionSchema, IndexDef, SchemaVersion},
+    storage::{DB, DocID, Document},
 };
 
 #[derive(Clone, PartialEq, Debug)]
@@ -21,14 +30,127 @@ enum Operator {
     Eq(Value),
     Gt(Value),
     Lt(Value),
-    In(Vec<Value>),
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub struct Predicate {
+struct Predicate {
     fld: String,
     op: Operator,
     idx: Option<String>,
+}
+
+pub(crate) enum Plan {
+    Join(Vec<Plan>),
+    Intersect(Vec<Plan>),
+    Fullscan(Expression),
+    Ixscan {
+        fields: Vec<Predicate>,
+        idx: String,
+    },
+    IxscanFilter {
+        fields: Vec<Predicate>,
+        idx: String,
+        filter: Expression,
+    },
+}
+
+struct PlanRuntime<'a> {
+    plan: Plan,
+    tx: &'a Transaction,
+}
+
+// struct IdxScan<'a, S: Stream<Item = Result<FdbValues, FdbError>> + Send + Sync + 'a> {
+struct IdxScan<'a> {
+    tx: &'a Transaction,
+    // fields: Vec<Predicate>,
+    collection: &'a Collection,
+    idx_space: Subspace,
+    filter: Option<Expression>,
+    // idx_stream: Option<S>,
+}
+
+type QueryResult = Result<Document, AppError>;
+
+// impl<'a, S> IdxScan<'a, S>
+// where
+//     S: Stream<Item = Result<FdbValues, FdbError>> + Send + Sync + Unpin + 'a,
+impl IdxScan<'_> {
+    fn execute(&self) -> impl Stream<Item = QueryResult> {
+        let opt = RangeOption::from(&self.idx_space);
+        self.tx
+            .get_ranges_keyvalues(opt, false)
+            .map_err(|e| AppError::Fdb {
+                e: String::from("scanning index"),
+                source: e,
+            })
+            .try_filter_map(async |value| {
+                let (schema_version, versionstamp) = self
+                    .idx_space
+                    .unpack::<(SchemaVersion, Versionstamp)>(value.key())
+                    .context(error::FdbTupleUnpack)?;
+                let doc_id = DocID::new(schema_version, versionstamp);
+                let Some(doc) = DB::get_doc_tx(self.collection, &doc_id, self.tx).await? else {
+                    whatever!("missing indexed document {doc_id}");
+                };
+                match &self.filter {
+                    Some(f) if f.execute(&doc) => Ok(Some(doc)),
+                    Some(_) => Ok(None),
+                    None => Ok(Some(doc)),
+                }
+            })
+    }
+    /*
+    async fn next(&mut self) -> Result<Option<Document>, AppError> {
+        let idx_stream = match self.idx_stream {
+            Some(s) => &mut s,
+            None => {
+                let opt = RangeOption::from(&self.idx_space);
+                self.idx_stream = Some(self.tx.get_ranges(opt, false));
+                self.idx_stream.as_mut().unwrap()
+            }
+        };
+        while let Some(idx_values) = idx_stream.next().await {
+            let idx_values = idx_values.context(error::Fdb {
+                e: "streaming index from FDB",
+            })?;
+            for val in idx_values {
+                let (schema_version, versionstamp) = self
+                    .idx_space
+                    .unpack::<(SchemaVersion, Versionstamp)>(val.key())
+                    .context(error::FdbTupleUnpack)?;
+                let doc_id = DocID::new(schema_version, versionstamp);
+                let doc = DB::get_doc_tx(self.collection, &doc_id, self.tx).await?;
+                let Some(doc) = doc else {
+                    eprintln!("ERROR, {doc_id}i from index is not found!");
+                    continue;
+                };
+                if let Some(filter) = &self.filter {
+                    if filter.execute(&doc) {
+                        return Ok(Some(doc));
+                    } else {
+                        continue;
+                    }
+                }
+                return Ok(Some(doc));
+            }
+        }
+        Ok(None)
+    }
+    */
+}
+
+impl Plan {
+    pub(crate) fn from_query(
+        collection: &Collection,
+        schema: &CollectionSchema,
+        query: &str,
+    ) -> Result<Self, AppError> {
+        todo!()
+    }
+
+    fn execute(self, tx: &Transaction) -> impl Stream<Item = Result<rmpv::Value, AppError>> {
+        PlanRuntime { plan: self, tx: tx }
+    }
 }
 
 impl TryFrom<&sexpression::Expression<'_>> for Expression {
@@ -87,6 +209,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Or(vec![
+                        // (ge .f v) is expanded to (or (gt .f v) (eq .f v))
                         Self::Atomic(Predicate {
                             fld: fld.clone(),
                             op: Operator::Gt(arg.clone()),
@@ -114,6 +237,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Or(vec![
+                        // (le .f v) is expanded to (or (lt .f v) (eq .f v))
                         Self::Atomic(Predicate {
                             fld: fld.clone(),
                             op: Operator::Lt(arg.clone()),
@@ -133,12 +257,18 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     for v in list.iter().skip(2) {
                         arg.push(Self::extract_constant(v)?);
                     }
-
-                    Ok(Self::Atomic(Predicate {
-                        fld,
-                        op: Operator::In(arg),
-                        idx: None,
-                    }))
+                    // (in .f v1 2 ...) is expaned into (or (eq f v1) (eq .f2 v2) ...)
+                    Ok(Self::Or(
+                        arg.into_iter()
+                            .map(|v| {
+                                Self::Atomic(Predicate {
+                                    fld: fld.clone(),
+                                    op: Operator::Eq(v),
+                                    idx: None,
+                                })
+                            })
+                            .collect(),
+                    ))
                 }
                 op => error::BadRequest {
                     e: format!("unknown operator {op}"),
@@ -172,6 +302,10 @@ impl TryFrom<&str> for Expression {
 }
 
 impl Expression {
+    fn execute(&self, doc: &Document) -> bool {
+        todo!()
+    }
+
     fn extract_field_ref(sexpr: &Sexpr) -> Result<String, AppError> {
         let Sexpr::Symbol(fld) = sexpr else {
             error::BadRequest {
@@ -266,25 +400,34 @@ fn assert_len(v: &[Sexpr], len: usize) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::planner::{Expression, Operator};
+    use crate::planner::{Expression, Operator, Predicate};
 
     #[test]
     fn parsing() {
         let p = Expression::try_from("(eq .foo 137)").unwrap();
         assert_eq!(
             p,
-            Expression::Atomic(Operator::Eq(String::from(".foo"), rmpv::Value::from(137)))
+            Expression::Atomic(Predicate {
+                fld: String::from(".foo"),
+                op: Operator::Eq(rmpv::Value::from(137)),
+                idx: None,
+            })
         );
 
         let p = Expression::try_from(r#"(and (eq .foo 137) (eq .bar "chlos"))"#).unwrap();
         assert_eq!(
             p,
             Expression::And(vec![
-                Expression::Atomic(Operator::Eq(String::from(".foo"), rmpv::Value::from(137))),
-                Expression::Atomic(Operator::Eq(
-                    String::from(".bar"),
-                    rmpv::Value::from("chlos")
-                )),
+                Expression::Atomic(Predicate {
+                    fld: String::from(".foo"),
+                    op: Operator::Eq(rmpv::Value::from(137)),
+                    idx: None,
+                }),
+                Expression::Atomic(Predicate {
+                    fld: String::from(".bar"),
+                    op: Operator::Eq(rmpv::Value::from("chlos")),
+                    idx: None,
+                }),
             ])
         );
     }

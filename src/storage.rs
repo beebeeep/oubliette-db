@@ -2,6 +2,7 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use crate::{
     error::{self, AppError, MPVDecode},
+    planner::Plan,
     predicate::Predicate,
     schema::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
@@ -10,20 +11,20 @@ use crate::{
     values,
 };
 use foundationdb::{
-    RangeOption,
+    RangeOption, Transaction,
     options::MutationType,
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DocID {
     schema: SchemaVersion,
     versionstamp: Versionstamp,
 }
 impl DocID {
-    fn new(schema: SchemaVersion, versionstamp: Versionstamp) -> Self {
+    pub(crate) fn new(schema: SchemaVersion, versionstamp: Versionstamp) -> Self {
         Self {
             schema,
             versionstamp,
@@ -259,12 +260,20 @@ impl DB {
         let p = Predicate::from_query(query).whatever_context("parsing query")?;
         let mut query_result = Vec::with_capacity(1);
         let collection = Collection::from((db, collection));
+        let schema = self.schema.read().await;
 
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
         // TODO: implement query planner lol
         // doing fullscan instead
+        let Some(coll_schema) = schema.collections.get(&collection) else {
+            error::BadRequest {
+                e: "unknown collection",
+            }
+            .fail()?
+        };
+        let plan = Plan::from_query(&collection, coll_schema, query)?;
         let subspace = collection.subspace().subspace(&KEY_PK);
         let opts = RangeOption::from(&subspace);
         let mut results = tx.get_ranges(opts, false);
@@ -319,6 +328,25 @@ impl DB {
                     e: "decoding document",
                 },
             )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_doc_tx(
+        collection: &Collection,
+        id: &DocID,
+        tx: &Transaction,
+    ) -> Result<Option<Document>, AppError> {
+        let key = collection.subspace().pack(&(id.schema, &id.versionstamp));
+        match tx.get(&key, false).await.context(error::Fdb {
+            e: "reading document",
+        })? {
+            Some(data) => Ok(Some(Document {
+                doc: rmpv::decode::read_value(&mut data.as_ref()).context(MPVDecode {
+                    e: "decoding document",
+                })?,
+                id: id.clone(),
+            })),
             None => Ok(None),
         }
     }
