@@ -3,7 +3,7 @@ use std::future;
 use foundationdb::{
     FdbError, RangeOption, TransactError, Transaction, TransactionCancelled,
     future::FdbValues,
-    tuple::{Subspace, Versionstamp},
+    tuple::{self, Subspace, Versionstamp},
 };
 use futures::{Stream, StreamExt, TryStreamExt, future::Either, stream};
 use rmpv::Value;
@@ -11,7 +11,7 @@ use sexpression::Expression as Sexpr;
 use snafu::{ResultExt, whatever};
 
 use crate::{
-    error::{self, AppError},
+    error::{self, AppError, MPVDecode},
     schema::{Collection, CollectionSchema, IndexDef, SchemaVersion},
     storage::{DB, DocID, Document},
 };
@@ -69,13 +69,49 @@ struct IdxScan<'a> {
     // idx_stream: Option<S>,
 }
 
-type QueryResult = Result<Document, AppError>;
+struct Fullscan<'a> {
+    tx: &'a Transaction,
+    collection: &'a Collection,
+    filter: Expression,
+}
+
+impl Fullscan<'_> {
+    fn execute(&self) -> impl Stream<Item = Result<Document, AppError>> {
+        let opt = RangeOption::from(&self.collection.subspace());
+        self.tx
+            .get_ranges_keyvalues(opt, false)
+            .map_err(|e| AppError::Fdb {
+                e: String::from("scanning collection"),
+                source: e,
+            })
+            .try_filter_map(async |value| {
+                let (_space, _db, _collection, _pk, schema_version, versionstamp) =
+                    tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(
+                        value.key(),
+                    )
+                    .context(error::FdbTupleUnpack)?;
+                let doc = Document {
+                    id: DocID::new(schema_version, versionstamp),
+                    doc: rmpv::decode::read_value(&mut value.value().as_ref()).context(
+                        MPVDecode {
+                            e: "decoding document",
+                        },
+                    )?,
+                };
+                if self.filter.evaluate(&doc) {
+                    Ok(Some(doc))
+                } else {
+                    Ok(None)
+                }
+            })
+    }
+}
 
 // impl<'a, S> IdxScan<'a, S>
 // where
 //     S: Stream<Item = Result<FdbValues, FdbError>> + Send + Sync + Unpin + 'a,
 impl IdxScan<'_> {
-    fn execute(&self) -> impl Stream<Item = QueryResult> {
+    fn execute(&self) -> impl Stream<Item = Result<Document, AppError>> {
         let opt = RangeOption::from(&self.idx_space);
         self.tx
             .get_ranges_keyvalues(opt, false)
@@ -93,7 +129,7 @@ impl IdxScan<'_> {
                     whatever!("missing indexed document {doc_id}");
                 };
                 match &self.filter {
-                    Some(f) if f.execute(&doc) => Ok(Some(doc)),
+                    Some(f) if f.evaluate(&doc) => Ok(Some(doc)),
                     Some(_) => Ok(None),
                     None => Ok(Some(doc)),
                 }
@@ -302,42 +338,8 @@ impl TryFrom<&str> for Expression {
 }
 
 impl Expression {
-    fn execute(&self, doc: &Document) -> bool {
+    fn evaluate(&self, doc: &Document) -> bool {
         todo!()
-    }
-
-    fn extract_field_ref(sexpr: &Sexpr) -> Result<String, AppError> {
-        let Sexpr::Symbol(fld) = sexpr else {
-            error::BadRequest {
-                e: "field name expected, got {sexpr:?}",
-            }
-            .fail()?
-        };
-        if !fld.starts_with(".") {
-            error::BadRequest {
-                e: "field name should start with dot, got {fld}",
-            }
-            .fail()?
-        }
-        Ok(String::from(*fld))
-    }
-
-    fn extract_constant(sexpr: &Sexpr) -> Result<Value, AppError> {
-        match sexpr {
-            Sexpr::Number(n) => {
-                if n.fract() == 0.0 {
-                    Ok(rmpv::Value::from(*n as i64))
-                } else {
-                    Ok(rmpv::Value::from(*n))
-                }
-            }
-            Sexpr::Bool(b) => Ok(rmpv::Value::from(*b)),
-            Sexpr::Str(s) => Ok(rmpv::Value::from(*s)),
-            v => error::BadRequest {
-                e: format!("constant expected, got {v:?}"),
-            }
-            .fail()?,
-        }
     }
 
     fn hydrate_indexes(&mut self, schema: &CollectionSchema) {
@@ -374,6 +376,40 @@ impl Expression {
             Expression::Not(_) => false,
             Expression::Empty => true,
             Expression::Atomic(predicate) => predicate.idx.is_some(),
+        }
+    }
+
+    fn extract_field_ref(sexpr: &Sexpr) -> Result<String, AppError> {
+        let Sexpr::Symbol(fld) = sexpr else {
+            error::BadRequest {
+                e: "field name expected, got {sexpr:?}",
+            }
+            .fail()?
+        };
+        if !fld.starts_with(".") {
+            error::BadRequest {
+                e: "field name should start with dot, got {fld}",
+            }
+            .fail()?
+        }
+        Ok(String::from(*fld))
+    }
+
+    fn extract_constant(sexpr: &Sexpr) -> Result<Value, AppError> {
+        match sexpr {
+            Sexpr::Number(n) => {
+                if n.fract() == 0.0 {
+                    Ok(rmpv::Value::from(*n as i64))
+                } else {
+                    Ok(rmpv::Value::from(*n))
+                }
+            }
+            Sexpr::Bool(b) => Ok(rmpv::Value::from(*b)),
+            Sexpr::Str(s) => Ok(rmpv::Value::from(*s)),
+            v => error::BadRequest {
+                e: format!("constant expected, got {v:?}"),
+            }
+            .fail()?,
         }
     }
 }
