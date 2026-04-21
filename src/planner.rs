@@ -16,6 +16,13 @@ use crate::{
     storage::{DB, DocID, Document},
 };
 
+pub(crate) enum PlanResult<A, B, C, D> {
+    Union(A),
+    Filter(B),
+    Fullscan(C),
+    IdxScan(D),
+}
+
 pub(crate) enum Plan<'a> {
     Union(Vec<Plan<'a>>),
     Filter(Filter<'a>),
@@ -23,17 +30,17 @@ pub(crate) enum Plan<'a> {
     IdxScan(IdxScan<'a>),
 }
 
-struct Filter<'a> {
+pub(crate) struct Filter<'a> {
     driver: Box<Plan<'a>>,
     filter: Expression,
 }
 
-struct IdxScan<'a> {
+pub(crate) struct IdxScan<'a> {
     collection: &'a Collection,
     idx_space: Subspace,
 }
 
-struct Fullscan<'a> {
+pub(crate) struct Fullscan<'a> {
     collection: &'a Collection,
     filter: Expression,
 }
@@ -161,7 +168,7 @@ impl<'a> Plan<'a> {
     }
 
     pub(crate) fn execute(
-        self,
+        &self,
         tx: &Transaction,
     ) -> impl Stream<Item = Result<Document, AppError>> + Send + Sync {
         stream::once(future::ready(Err(AppError::BadRequest {
