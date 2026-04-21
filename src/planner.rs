@@ -17,16 +17,20 @@ use crate::{
 };
 
 pub(crate) enum Plan<'a> {
-    Join(Vec<Plan<'a>>),
-    Intersect(Vec<Plan<'a>>),
+    Union(Vec<Plan<'a>>),
+    Filter(Filter<'a>),
     Fullscan(Fullscan<'a>),
     IdxScan(IdxScan<'a>),
+}
+
+struct Filter<'a> {
+    driver: Box<Plan<'a>>,
+    filter: Expression,
 }
 
 struct IdxScan<'a> {
     collection: &'a Collection,
     idx_space: Subspace,
-    filter: Option<Expression>,
 }
 
 struct Fullscan<'a> {
@@ -85,11 +89,7 @@ impl IdxScan<'_> {
                 let Some(doc) = DB::get_doc_tx(self.collection, &doc_id, tx).await? else {
                     whatever!("missing indexed document {doc_id}");
                 };
-                match &self.filter {
-                    Some(f) if f.evaluate(&doc) => Ok(Some(doc)),
-                    Some(_) => Ok(None),
-                    None => Ok(Some(doc)),
-                }
+                Ok(Some(doc))
             })
     }
     /*
