@@ -3,7 +3,6 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 use crate::{
     error::{self, AppError, MPVDecode},
     planner::Plan,
-    predicate::Predicate,
     schema::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
         SPACE_DATA, SchemaUpdate, SchemaVersion,
@@ -210,7 +209,7 @@ impl DB {
                 let Some(value) = values::extract_field(&field, doc) else {
                     continue 'NEXT_INDEX;
                 };
-                match value {
+                match value.as_ref() {
                     rmpv::Value::Boolean(b) => {
                         idx_subspace = idx_subspace.subspace(b);
                     }

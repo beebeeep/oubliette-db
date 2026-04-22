@@ -9,7 +9,7 @@ mod error;
 mod expression;
 mod http_api;
 mod planner;
-mod predicate;
+// mod predicate;
 mod schema;
 mod storage;
 mod values;

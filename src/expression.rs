@@ -2,8 +2,8 @@ use crate::{
     error::{self, AppError},
     schema::CollectionSchema,
     storage::Document,
+    values::{Value, extract_field},
 };
-use rmpv::Value;
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
 
@@ -17,60 +17,58 @@ pub(crate) enum Expression {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub(crate) enum Operator {
-    Eq(Value),
-    Gt(Value),
-    Lt(Value),
+pub(crate) enum Relation {
+    Eq,
+    Gt,
+    Ge,
+    Lt,
+    Le,
 }
 
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Predicate {
     fld: String,
-    op: Operator,
-    idx: Option<String>,
+    rel: Relation,
+    val: Value,
+}
+
+impl Predicate {
+    fn evaluate(&self, doc: &Document) -> bool {
+        let Some(lhs) = extract_field(&self.fld, &doc.doc) else {
+            return false;
+        };
+        let rhs = Value::from_ref(&doc.doc);
+
+        match self.rel {
+            Relation::Eq => lhs == rhs,
+            Relation::Gt => lhs > rhs,
+            Relation::Ge => lhs >= rhs,
+            Relation::Lt => lhs < rhs,
+            Relation::Le => lhs <= rhs,
+        }
+    }
 }
 
 impl Expression {
     pub(crate) fn evaluate(&self, doc: &Document) -> bool {
-        todo!()
-    }
-
-    pub(crate) fn hydrate_indexes(&mut self, schema: &CollectionSchema) {
         match self {
-            Expression::And(expressions) => {
-                expressions
-                    .iter_mut()
-                    .for_each(|e| e.hydrate_indexes(schema));
-            }
-            Expression::Or(expressions) => {
-                expressions
-                    .iter_mut()
-                    .for_each(|e| e.hydrate_indexes(schema));
-            }
-            Expression::Not(expression) => {
-                expression.hydrate_indexes(schema);
-            }
-            Expression::Atomic(predicate) => {
-                for (index, def) in schema.indexes.iter() {
-                    if def.ready && def.fields[0].0 == predicate.fld {
-                        predicate.idx = Some(index.clone());
-                        break;
-                    }
-                }
-            }
-            Expression::Empty => {}
-        }
-    }
-
-    fn is_sargable(&self) -> bool {
-        match self {
-            Expression::And(expressions) => expressions.iter().any(|e| e.is_sargable()),
-            Expression::Or(expressions) => expressions.iter().all(|e| e.is_sargable()),
-            Expression::Not(_) => false,
+            Expression::And(expressions) => expressions.iter().all(|e| e.evaluate(doc)),
+            Expression::Or(expressions) => expressions.iter().any(|e| e.evaluate(doc)),
+            Expression::Not(expression) => !expression.evaluate(doc),
+            Expression::Atomic(predicate) => predicate.evaluate(doc),
             Expression::Empty => true,
-            Expression::Atomic(predicate) => predicate.idx.is_some(),
         }
     }
+
+    // fn is_sargable(&self) -> bool {
+    //     match self {
+    //         Expression::And(expressions) => expressions.iter().any(|e| e.is_sargable()),
+    //         Expression::Or(expressions) => expressions.iter().all(|e| e.is_sargable()),
+    //         Expression::Not(_) => false,
+    //         Expression::Empty => true,
+    //         Expression::Atomic(predicate) => predicate.idx.is_some(),
+    //     }
+    // }
 
     fn extract_field_ref(sexpr: &Sexpr) -> Result<String, AppError> {
         let Sexpr::Symbol(fld) = sexpr else {
@@ -92,13 +90,13 @@ impl Expression {
         match sexpr {
             Sexpr::Number(n) => {
                 if n.fract() == 0.0 {
-                    Ok(rmpv::Value::from(*n as i64))
+                    Ok(Value::from(*n as i64))
                 } else {
-                    Ok(rmpv::Value::from(*n))
+                    Ok(Value::from(*n))
                 }
             }
-            Sexpr::Bool(b) => Ok(rmpv::Value::from(*b)),
-            Sexpr::Str(s) => Ok(rmpv::Value::from(*s)),
+            Sexpr::Bool(b) => Ok(Value::from(*b)),
+            Sexpr::Str(s) => Ok(Value::from(*s)),
             v => error::BadRequest {
                 e: format!("constant expected, got {v:?}"),
             }
@@ -161,8 +159,8 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(Predicate {
                         fld,
-                        op: Operator::Eq(arg),
-                        idx: None,
+                        rel: Relation::Eq,
+                        val: arg,
                     }))
                 }
                 "gt" => {
@@ -171,27 +169,19 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(Predicate {
                         fld,
-                        op: Operator::Gt(arg),
-                        idx: None,
+                        rel: Relation::Gt,
+                        val: arg,
                     }))
                 }
                 "ge" => {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Or(vec![
-                        // (ge .f v) is expanded to (or (gt .f v) (eq .f v))
-                        Self::Atomic(Predicate {
-                            fld: fld.clone(),
-                            op: Operator::Gt(arg.clone()),
-                            idx: None,
-                        }),
-                        Self::Atomic(Predicate {
-                            fld,
-                            op: Operator::Eq(arg),
-                            idx: None,
-                        }),
-                    ]))
+                    Ok(Self::Atomic(Predicate {
+                        fld: fld.clone(),
+                        rel: Relation::Ge,
+                        val: arg,
+                    }))
                 }
                 "lt" => {
                     assert_len(&list, 3)?;
@@ -199,27 +189,19 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(Predicate {
                         fld,
-                        op: Operator::Lt(arg),
-                        idx: None,
+                        rel: Relation::Lt,
+                        val: arg,
                     }))
                 }
                 "le" => {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Or(vec![
-                        // (le .f v) is expanded to (or (lt .f v) (eq .f v))
-                        Self::Atomic(Predicate {
-                            fld: fld.clone(),
-                            op: Operator::Lt(arg.clone()),
-                            idx: None,
-                        }),
-                        Self::Atomic(Predicate {
-                            fld,
-                            op: Operator::Eq(arg),
-                            idx: None,
-                        }),
-                    ]))
+                    Ok(Self::Atomic(Predicate {
+                        fld,
+                        rel: Relation::Le,
+                        val: arg,
+                    }))
                 }
                 "in" => {
                     assert_longer(&list, 2)?;
@@ -234,8 +216,8 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                             .map(|v| {
                                 Self::Atomic(Predicate {
                                     fld: fld.clone(),
-                                    op: Operator::Eq(v),
-                                    idx: None,
+                                    rel: Relation::Eq,
+                                    val: v,
                                 })
                             })
                             .collect(),
@@ -277,7 +259,7 @@ fn assert_len(v: &[Sexpr], len: usize) -> Result<(), AppError> {
 
 #[cfg(test)]
 mod tests {
-    use crate::expression::{Expression, Operator, Predicate};
+    use crate::expression::{Expression, Predicate, Relation};
 
     #[test]
     fn parsing() {
@@ -286,7 +268,7 @@ mod tests {
             p,
             Expression::Atomic(Predicate {
                 fld: String::from(".foo"),
-                op: Operator::Eq(rmpv::Value::from(137)),
+                op: Relation::Eq(Value::from(137)),
                 idx: None,
             })
         );
@@ -297,12 +279,12 @@ mod tests {
             Expression::And(vec![
                 Expression::Atomic(Predicate {
                     fld: String::from(".foo"),
-                    op: Operator::Eq(rmpv::Value::from(137)),
+                    op: Relation::Eq(Value::from(137)),
                     idx: None,
                 }),
                 Expression::Atomic(Predicate {
                     fld: String::from(".bar"),
-                    op: Operator::Eq(rmpv::Value::from("chlos")),
+                    op: Relation::Eq(Value::from("chlos")),
                     idx: None,
                 }),
             ])

@@ -5,8 +5,7 @@ use foundationdb::{
     future::FdbValues,
     tuple::{self, Subspace, Versionstamp},
 };
-use futures::{Stream, StreamExt, TryStreamExt, future::Either, stream};
-use rmpv::Value;
+use futures::{Stream, StreamExt, TryStreamExt, stream};
 use snafu::{ResultExt, whatever};
 
 use crate::{
@@ -16,12 +15,11 @@ use crate::{
     storage::{DB, DocID, Document},
 };
 
-pub(crate) enum PlanResult<A, B, C, D> {
-    Union(A),
-    Filter(B),
-    Fullscan(C),
-    IdxScan(D),
-}
+/// DocumentStream is stream produced by Plan. Due to recursive nature of Plan type,
+/// the type shenanigans escalate quickly, so opting to dynamic dispatching with BoxStream.
+/// Performance cost should be negligible, as for every Document polled from the stream,
+/// there will be few dynamic dispatches, and one or two network round trips to FDB.
+pub(crate) type DocumentStream<'a> = stream::BoxStream<'a, Result<Document, AppError>>;
 
 pub(crate) enum Plan<'a> {
     Union(Vec<Plan<'a>>),
@@ -32,7 +30,7 @@ pub(crate) enum Plan<'a> {
 
 pub(crate) struct Filter<'a> {
     driver: Box<Plan<'a>>,
-    filter: Expression,
+    expr: Expression,
 }
 
 pub(crate) struct IdxScan<'a> {
@@ -146,7 +144,6 @@ impl<'a> Plan<'a> {
         query: &str,
     ) -> Result<Self, AppError> {
         let mut expr = Expression::try_from(query)?;
-        expr.hydrate_indexes(schema);
         Self::from_expr(expr, collection, schema)
     }
 
@@ -167,12 +164,25 @@ impl<'a> Plan<'a> {
         }
     }
 
-    pub(crate) fn execute(
-        &self,
-        tx: &Transaction,
-    ) -> impl Stream<Item = Result<Document, AppError>> + Send + Sync {
-        stream::once(future::ready(Err(AppError::BadRequest {
-            e: String::from("not implemented"),
-        })))
+    pub(crate) fn execute(&'a self, tx: &'a Transaction) -> DocumentStream<'a> {
+        match &self {
+            Plan::Union(plans) => {
+                let streams = plans.iter().map(|p| p.execute(tx));
+                stream::select_all(streams).boxed()
+            }
+            Plan::Filter(filter) => filter
+                .driver
+                .execute(tx)
+                .try_filter_map(async |doc| {
+                    if filter.expr.evaluate(&doc) {
+                        Ok(Some(doc))
+                    } else {
+                        Ok(None)
+                    }
+                })
+                .boxed(),
+            Plan::Fullscan(fullscan) => fullscan.execute(tx).boxed(),
+            Plan::IdxScan(idx_scan) => idx_scan.execute(tx).boxed(),
+        }
     }
 }
