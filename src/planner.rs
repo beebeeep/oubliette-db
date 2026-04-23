@@ -1,4 +1,4 @@
-use std::future;
+use std::{future, ops::Deref};
 
 use foundationdb::{
     FdbError, RangeOption, TransactError, Transaction, TransactionCancelled,
@@ -6,12 +6,15 @@ use foundationdb::{
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
+use regex::CaptureLocations;
+use sexpression::Expression as Sexpr;
 use snafu::{ResultExt, whatever};
 
 use crate::{
     error::{self, AppError, MPVDecode},
     expression::Expression,
-    schema::{Collection, CollectionSchema, IndexDef, SchemaVersion},
+    misc::{assert_len, assert_longer},
+    schema::{self, Collection, CollectionSchema, IndexDef, SchemaVersion},
     storage::{DB, DocID, Document},
 };
 
@@ -22,10 +25,10 @@ use crate::{
 pub(crate) type DocumentStream<'a> = stream::BoxStream<'a, Result<Document, AppError>>;
 
 pub(crate) enum Plan<'a> {
-    Union(Vec<Plan<'a>>),
-    Filter(Filter<'a>),
-    Fullscan(Fullscan<'a>),
-    IdxScan(IdxScan<'a>),
+    Union(Vec<Plan<'a>>),   // (union (subplan1) (subplan2) ...)
+    Filter(Filter<'a>),     // (filter (subplan) (filter-expr))
+    Fullscan(Fullscan<'a>), // (scan (filter-expr))
+    IdxScan(IdxScan<'a>), // (idxscan (idx-field1-predicate) (idx-field2-predicate) ...), different predicates are intersected (i.e. joined by AND)
 }
 
 pub(crate) struct Filter<'a> {
@@ -36,6 +39,10 @@ pub(crate) struct Filter<'a> {
 pub(crate) struct IdxScan<'a> {
     collection: &'a Collection,
     idx_space: Subspace,
+    // TODO: add extra filter here to support range scans over composite indexes:
+    // Suppose (foo, bar) is index, and query is (and (gt .foo 300) (le .bar 200))
+    // Scan takes continious subrange where .foo > 300 and can select only those index entries
+    // where .bar <= 200, *before* fetching the documents from FDB
 }
 
 pub(crate) struct Fullscan<'a> {
@@ -43,7 +50,14 @@ pub(crate) struct Fullscan<'a> {
     filter: Expression,
 }
 
-impl Fullscan<'_> {
+impl<'a> Fullscan<'a> {
+    fn from_expr(expr: &Sexpr, collection: &'a Collection) -> Result<Self, AppError> {
+        Ok(Self {
+            collection,
+            filter: Expression::try_from(expr)?,
+        })
+    }
+
     fn execute(&self, tx: &Transaction) -> impl Stream<Item = Result<Document, AppError>> {
         let opt = RangeOption::from(&self.collection.subspace());
         tx.get_ranges_keyvalues(opt, false)
@@ -74,10 +88,70 @@ impl Fullscan<'_> {
     }
 }
 
-// impl<'a, S> IdxScan<'a, S>
-// where
-//     S: Stream<Item = Result<FdbValues, FdbError>> + Send + Sync + Unpin + 'a,
-impl IdxScan<'_> {
+impl<'a> IdxScan<'a> {
+    fn from_exprs(
+        exprs: &[Sexpr],
+        collection: &'a Collection,
+        schema: &CollectionSchema,
+    ) -> Result<Self, AppError> {
+        let mut predicates = Vec::with_capacity(exprs.len());
+        for expr in exprs {
+            let expr = Expression::try_from(expr)?;
+            let Expression::Atomic(predicate) = expr else {
+                return error::BadRequest {
+                    e: "ixscan expression shall be predicate using indexed field",
+                }
+                .fail();
+            };
+            predicates.push(predicate);
+        }
+        let predicate_fields: Vec<&str> = predicates.iter().map(|p| p.fld.as_str()).collect();
+
+        'NEXT_INDEX: for (idx_name, def) in schema.indexes.iter() {
+            if !def.ready || predicate_fields.len() > def.fields.len() {
+                continue;
+            }
+            for f in predicate_fields.iter() {
+                if !def.fields.iter().any(|(field, _)| field.as_str() == *f) {
+                    continue 'NEXT_INDEX;
+                }
+            }
+            // all predicate fields are found in index, we can use it
+            let mut idx_space = collection
+                .subspace()
+                .subspace(&(schema::KEY_INDEX, idx_name));
+            for (field, prefix) in def.fields.iter() {
+                let predicate = predicates.iter().find(|p| &p.fld == field).unwrap();
+                let val = match prefix {
+                    Some(prefix) => {
+                        let mut v = predicate.val.clone();
+                        v.truncate(*prefix)?;
+                        v
+                    }
+                    None => predicate.val.clone(),
+                };
+                match predicate.rel {
+                    crate::expression::Relation::Eq => {
+                        idx_space = idx_space.subspace(&val);
+                    }
+                    crate::expression::Relation::Gt => todo!("relation unsupported"),
+                    crate::expression::Relation::Ge => todo!("relation unsupported"),
+                    crate::expression::Relation::Lt => todo!("relation unsupported"),
+                    crate::expression::Relation::Le => todo!("relation unsupported"),
+                }
+            }
+            return Ok(Self {
+                collection,
+                idx_space,
+            });
+        }
+
+        return error::BadRequest {
+            e: "idxscan refers to non-indexed fields",
+        }
+        .fail();
+    }
+
     fn execute(&self, tx: &Transaction) -> impl Stream<Item = Result<Document, AppError>> {
         let opt = RangeOption::from(&self.idx_space);
         tx.get_ranges_keyvalues(opt, false)
@@ -97,75 +171,84 @@ impl IdxScan<'_> {
                 Ok(Some(doc))
             })
     }
-    /*
-    async fn next(&mut self) -> Result<Option<Document>, AppError> {
-        let idx_stream = match self.idx_stream {
-            Some(s) => &mut s,
-            None => {
-                let opt = RangeOption::from(&self.idx_space);
-                self.idx_stream = Some(self.tx.get_ranges(opt, false));
-                self.idx_stream.as_mut().unwrap()
-            }
-        };
-        while let Some(idx_values) = idx_stream.next().await {
-            let idx_values = idx_values.context(error::Fdb {
-                e: "streaming index from FDB",
-            })?;
-            for val in idx_values {
-                let (schema_version, versionstamp) = self
-                    .idx_space
-                    .unpack::<(SchemaVersion, Versionstamp)>(val.key())
-                    .context(error::FdbTupleUnpack)?;
-                let doc_id = DocID::new(schema_version, versionstamp);
-                let doc = DB::get_doc_tx(self.collection, &doc_id, self.tx).await?;
-                let Some(doc) = doc else {
-                    eprintln!("ERROR, {doc_id}i from index is not found!");
-                    continue;
-                };
-                if let Some(filter) = &self.filter {
-                    if filter.execute(&doc) {
-                        return Ok(Some(doc));
-                    } else {
-                        continue;
-                    }
-                }
-                return Ok(Some(doc));
-            }
-        }
-        Ok(None)
-    }
-    */
 }
 
 impl<'a> Plan<'a> {
-    pub(crate) fn from_query(
+    pub(crate) fn from_str(
         collection: &'a Collection,
         schema: &CollectionSchema,
-        query: &str,
+        plan: &str,
     ) -> Result<Self, AppError> {
-        let mut expr = Expression::try_from(query)?;
-        Self::from_expr(expr, collection, schema)
+        let (plan, _) = sexpression::read(plan).context(error::QueryParse {
+            e: "failed to parse plan",
+        })?;
+
+        Self::from_expr(&plan, collection, schema)
     }
 
     fn from_expr(
-        expr: Expression,
+        expr: &Sexpr,
         collection: &'a Collection,
         schema: &CollectionSchema,
     ) -> Result<Self, AppError> {
-        match expr {
-            Expression::And(expressions) => todo!(),
-            Expression::Or(expressions) => todo!(),
-            Expression::Not(expression) => todo!(),
-            Expression::Atomic(predicate) => todo!(),
-            Expression::Empty => Ok(Self::Fullscan(Fullscan {
-                collection,
-                filter: Expression::Empty,
-            })),
+        let Sexpr::List(list) = expr else {
+            return error::BadRequest {
+                e: "plan expression must be list",
+            }
+            .fail();
+        };
+        Self::from_list(list, collection, schema)
+    }
+
+    fn from_list(
+        list: &[Sexpr],
+        collection: &'a Collection,
+        schema: &CollectionSchema,
+    ) -> Result<Self, AppError> {
+        match list.get(0) {
+            Some(Sexpr::Symbol(op)) => match *op {
+                "ixscan" => {
+                    assert_longer(&list, 1)?;
+                    Ok(Self::IdxScan(IdxScan::from_exprs(
+                        &list[1..],
+                        collection,
+                        schema,
+                    )?))
+                }
+                "scan" => {
+                    assert_len(&list, 2)?;
+                    Ok(Self::Fullscan(Fullscan::from_expr(&list[1], collection)?))
+                }
+                "filter" => {
+                    assert_len(&list, 3)?;
+                    Ok(Self::Filter(Filter {
+                        driver: Box::new(Self::from_expr(&list[1], collection, schema)?),
+                        expr: Expression::try_from(&list[2])?,
+                    }))
+                }
+                "union" => {
+                    assert_longer(&list, 2)?;
+                    let mut es = Vec::with_capacity(list.len() - 1);
+                    for e in list.iter().skip(1) {
+                        es.push(Self::from_expr(e, collection, schema)?);
+                    }
+                    Ok(Self::Union(es))
+                }
+                v => error::BadRequest {
+                    e: format!("unknown plan operation: {v}"),
+                }
+                .fail()?,
+            },
+            Some(v) => error::BadRequest {
+                e: format!("failed to parse plan: unknown token {v}"),
+            }
+            .fail()?,
+            None => error::BadRequest { e: "empty plan" }.fail()?,
         }
     }
 
     pub(crate) fn execute(&'a self, tx: &'a Transaction) -> DocumentStream<'a> {
-        match &self {
+        match self {
             Plan::Union(plans) => {
                 let streams = plans.iter().map(|p| p.execute(tx));
                 stream::select_all(streams).boxed()

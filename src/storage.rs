@@ -269,7 +269,7 @@ impl DB {
             }
             .fail()?
         };
-        let plan = Plan::from_query(&collection, coll_schema, query)?;
+        let plan = Plan::from_str(&collection, coll_schema, query)?;
         let mut result = plan.execute(&tx);
         while let Some(doc) = result.next().await {
             query_result.push(doc?);

@@ -10,6 +10,7 @@ mod expression;
 mod http_api;
 mod planner;
 // mod predicate;
+mod misc;
 mod schema;
 mod storage;
 mod values;

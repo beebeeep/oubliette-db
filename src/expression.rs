@@ -1,5 +1,6 @@
 use crate::{
     error::{self, AppError},
+    misc::{assert_len, assert_longer},
     schema::CollectionSchema,
     storage::Document,
     values::{Value, extract_field},
@@ -27,9 +28,9 @@ pub(crate) enum Relation {
 
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Predicate {
-    fld: String,
-    rel: Relation,
-    val: Value,
+    pub(crate) fld: String,
+    pub(crate) rel: Relation,
+    pub(crate) val: Value,
 }
 
 impl Predicate {
@@ -235,26 +236,6 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
             None => Ok(Self::Empty),
         }
     }
-}
-
-fn assert_longer(v: &[Sexpr], len: usize) -> Result<(), AppError> {
-    if v.len() <= len {
-        error::BadRequest {
-            e: format!("invalid length of expression {v:?}: more than {len} expected"),
-        }
-        .fail()?
-    }
-    Ok(())
-}
-
-fn assert_len(v: &[Sexpr], len: usize) -> Result<(), AppError> {
-    if v.len() != len {
-        error::BadRequest {
-            e: format!("invalid length of expression {v:?}: {len} expected"),
-        }
-        .fail()?
-    }
-    Ok(())
 }
 
 #[cfg(test)]

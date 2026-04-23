@@ -2,6 +2,9 @@ use std::cmp::Ordering;
 
 use base64::prelude::*;
 use bytemuck::TransparentWrapper;
+use snafu::OptionExt;
+
+use crate::error::AppError;
 
 /// Value wraps rmpv::Value providing a bit more flexible comparison operations (can compare ints with floats and different floats with each other)
 #[repr(transparent)]
@@ -11,6 +14,16 @@ pub(crate) struct Value(pub(crate) rmpv::Value);
 impl Value {
     pub(crate) fn from_ref(v: &rmpv::Value) -> &Self {
         TransparentWrapper::wrap_ref(v)
+    }
+    pub(crate) fn truncate(&mut self, len: usize) -> Result<(), AppError> {
+        if let rmpv::Value::String(us) = &self.0 {
+            let mut s = us.as_str().whatever_context("non UTF-8 string")?;
+            if len < s.len() {
+                s = &s[..s.floor_char_boundary(len)];
+                self.0 = rmpv::Value::from(s);
+            }
+        }
+        Ok(())
     }
 }
 
@@ -71,6 +84,29 @@ impl PartialOrd for Value {
             (rmpv::Value::Integer(a), rmpv::Value::F32(b)) => cmp_f64(*b as f64, a),
             (rmpv::Value::Integer(a), rmpv::Value::F64(b)) => cmp_f64(*b, a),
             (_, _) => None,
+        }
+    }
+}
+
+impl foundationdb::tuple::TuplePack for Value {
+    fn pack<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        tuple_depth: foundationdb::tuple::TupleDepth,
+    ) -> std::io::Result<foundationdb::tuple::VersionstampOffset> {
+        match &self.0 {
+            rmpv::Value::Boolean(b) => b.pack(w, tuple_depth),
+            rmpv::Value::Integer(n) => {
+                if let Some(n) = n.as_u64() {
+                    n.pack(w, tuple_depth)
+                } else {
+                    return n.as_i64().unwrap().pack(w, tuple_depth);
+                }
+            }
+            rmpv::Value::F32(f) => f.pack(w, tuple_depth),
+            rmpv::Value::F64(f) => f.pack(w, tuple_depth),
+            rmpv::Value::String(s) => s.as_str().unwrap().pack(w, tuple_depth),
+            _ => unimplemented!("data type not supported"),
         }
     }
 }
