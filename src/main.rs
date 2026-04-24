@@ -8,12 +8,12 @@ use snafu::prelude::*;
 mod error;
 mod expression;
 mod http_api;
-mod planner;
-// mod predicate;
 mod misc;
+mod planner;
 mod schema;
 mod storage;
 mod values;
+mod worker;
 
 #[tokio::main]
 async fn main() -> Result<(), AppError> {

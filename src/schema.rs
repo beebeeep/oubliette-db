@@ -1,10 +1,13 @@
-use std::{collections::HashMap, fmt::Display, sync::LazyLock};
+use std::{collections::HashMap, fmt::Display, sync::LazyLock, time};
 
 use foundationdb::tuple::Subspace;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 
-use crate::error::{self, AppError};
+use crate::{
+    error::{self, AppError},
+    storage::DocID,
+};
 
 /*
     Key layout:
@@ -48,6 +51,8 @@ pub(crate) type IndexField = (String, Option<usize>);
 pub(crate) struct IndexDef {
     pub(crate) fields: Vec<IndexField>,
     pub(crate) ready: bool,
+    pub(crate) lock_timestamp: Option<u128>, // unixtime in ms
+    pub(crate) last_indexed_doc: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -186,16 +191,20 @@ impl InstanceSchema {
             }
         }
 
-        let mut schema_bytes = Vec::new();
-        current_schema
-            .serialize(&mut rmp_serde::Serializer::new(&mut schema_bytes))
-            .whatever_context("serializing schema")?;
-        let key = Subspace::from_bytes(SPACE_META).pack(&(KEY_SCHEMA));
-        tx.set(&key, &schema_bytes);
+        current_schema.write_to_db(&tx).await?;
         tx.commit().await.context(error::FdbTransactionCommit)?;
 
         *self = current_schema;
 
+        Ok(())
+    }
+
+    pub(crate) async fn write_to_db(&self, tx: &foundationdb::Transaction) -> Result<(), AppError> {
+        let mut schema_bytes = Vec::new();
+        self.serialize(&mut rmp_serde::Serializer::new(&mut schema_bytes))
+            .whatever_context("serializing schema")?;
+        let key = Subspace::from_bytes(SPACE_META).pack(&(KEY_SCHEMA));
+        tx.set(&key, &schema_bytes);
         Ok(())
     }
 

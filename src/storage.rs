@@ -7,7 +7,7 @@ use crate::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
         SPACE_DATA, SchemaUpdate, SchemaVersion,
     },
-    values,
+    values, worker,
 };
 use foundationdb::{
     RangeOption, Transaction,
@@ -100,6 +100,8 @@ impl DB {
             fdb,
             schema: Arc::new(tokio::sync::RwLock::new(s)),
         };
+
+        worker::Worker::start(path, db.schema.clone()).await?;
 
         Ok(db)
     }
@@ -379,15 +381,13 @@ impl DB {
                     IndexDef {
                         fields: fields.clone(),
                         ready: true, // TODO: should be false on creation, to be set to true by backfill job
+                        lock_timestamp: None,
+                        last_indexed_doc: None,
                     },
                 )),
                 &self.fdb,
             )
             .await?;
-
-        self.backfill_index(db, collection, &fields, schema.version)
-            .await?;
-
         Ok(())
     }
 
