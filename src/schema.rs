@@ -41,7 +41,7 @@ pub(crate) struct CollectionSchema {
     pub(crate) indexes: HashMap<String, IndexDef>,
 }
 
-/// field name and prefix length (chars for utf-8 strings, bytes for binary strings)
+/// field name and prefix length in bytes (utf-8 strings are truncated to closest char boundary)
 pub(crate) type IndexField = (String, Option<usize>);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -111,6 +111,23 @@ impl Collection {
     pub(crate) fn subspace(&self) -> foundationdb::tuple::Subspace {
         Subspace::all().subspace(&(SPACE_DATA, self.db.as_ref(), self.collection.as_ref()))
     }
+    pub(crate) fn pk_subspace(&self) -> foundationdb::tuple::Subspace {
+        Subspace::all().subspace(&(
+            SPACE_DATA,
+            self.db.as_ref(),
+            self.collection.as_ref(),
+            KEY_PK,
+        ))
+    }
+    pub(crate) fn index_subspace(&self, index: &str) -> foundationdb::tuple::Subspace {
+        Subspace::all().subspace(&(
+            SPACE_DATA,
+            self.db.as_ref(),
+            self.collection.as_ref(),
+            KEY_INDEX,
+            index,
+        ))
+    }
 }
 
 impl InstanceSchema {
@@ -150,8 +167,7 @@ impl InstanceSchema {
             SchemaUpdate::UpdateCollection(col) => {
                 current_schema.collections.insert(collection.clone(), col);
             }
-            SchemaUpdate::CreateIndex((name, mut index)) => {
-                index.ready = false;
+            SchemaUpdate::CreateIndex((name, index)) => {
                 let col =
                     current_schema
                         .collections
@@ -355,7 +371,7 @@ mod tests {
                         (
                             String::from("idx_foo"),
                             IndexDef {
-                                fields: vec![(String::from(".foo"), 0)],
+                                fields: vec![(String::from(".foo"), Some(0))],
                                 ready: true,
                             },
                         ),
@@ -363,8 +379,8 @@ mod tests {
                             String::from("idx_foo_barbaz"),
                             IndexDef {
                                 fields: vec![
-                                    (String::from(".foo"), 0),
-                                    (String::from(".bar.baz"), 0),
+                                    (String::from(".foo"), Some(0)),
+                                    (String::from(".bar.baz"), Some(0)),
                                 ],
                                 ready: true,
                             },

@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize)]
 pub struct QueryRequest {
-    query: Box<str>,
+    query: Option<Box<str>>,
+    plan: Option<Box<str>>,
     limit: Option<usize>,
 }
 
@@ -101,7 +102,13 @@ pub(crate) async fn collection_query(
 ) -> Result<Json<QueryResponse>, AppError> {
     let query_result = state
         .db
-        .query(&db, &collection, &req.query, req.limit)
+        .query(
+            &db,
+            &collection,
+            req.query.as_deref(),
+            req.plan.as_deref(),
+            req.limit,
+        )
         .await?;
     let mut results = Vec::with_capacity(query_result.len());
     for doc in query_result {

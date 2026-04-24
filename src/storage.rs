@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Display, sync::Arc};
 
 use crate::{
     error::{self, AppError, MPVDecode},
-    predicate::Predicate,
+    planner::Plan,
     schema::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
         SPACE_DATA, SchemaUpdate, SchemaVersion,
@@ -10,20 +10,20 @@ use crate::{
     values,
 };
 use foundationdb::{
-    RangeOption,
+    RangeOption, Transaction,
     options::MutationType,
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct DocID {
     schema: SchemaVersion,
     versionstamp: Versionstamp,
 }
 impl DocID {
-    fn new(schema: SchemaVersion, versionstamp: Versionstamp) -> Self {
+    pub(crate) fn new(schema: SchemaVersion, versionstamp: Versionstamp) -> Self {
         Self {
             schema,
             versionstamp,
@@ -41,6 +41,14 @@ pub(crate) struct Document {
     pub(crate) doc: rmpv::Value,
 }
 
+impl Default for DocID {
+    fn default() -> Self {
+        Self {
+            schema: 0,
+            versionstamp: Versionstamp::from([0u8; 12]),
+        }
+    }
+}
 impl From<&DocID> for String {
     fn from(d: &DocID) -> Self {
         let mut s = hex::encode(d.schema.to_le_bytes());
@@ -160,8 +168,8 @@ impl DB {
             e: "starting transaction",
         })?;
 
-        let kt = (KEY_PK, schema.version, &Versionstamp::incomplete(0));
-        let key = collection.subspace().pack_with_versionstamp(&kt);
+        let kt = (schema.version, &Versionstamp::incomplete(0));
+        let key = collection.pk_subspace().pack_with_versionstamp(&kt);
 
         let mut payload = Vec::with_capacity(64);
         rmpv::encode::write_value(&mut payload, &doc).context(error::MPVEncode {
@@ -209,7 +217,7 @@ impl DB {
                 let Some(value) = values::extract_field(&field, doc) else {
                     continue 'NEXT_INDEX;
                 };
-                match value {
+                match value.as_ref() {
                     rmpv::Value::Boolean(b) => {
                         idx_subspace = idx_subspace.subspace(b);
                     }
@@ -253,47 +261,41 @@ impl DB {
         &self,
         db: &str,
         collection: &str,
-        query: &str,
+        query: Option<&str>,
+        plan: Option<&str>,
         limit: Option<usize>,
     ) -> Result<Vec<Document>, AppError> {
-        let p = Predicate::from_query(query).whatever_context("parsing query")?;
         let mut query_result = Vec::with_capacity(1);
         let collection = Collection::from((db, collection));
+        let schema = self.schema.read().await;
 
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
-        // TODO: implement query planner lol
-        // doing fullscan instead
-        let subspace = collection.subspace().subspace(&KEY_PK);
-        let opts = RangeOption::from(&subspace);
-        let mut results = tx.get_ranges(opts, false);
-        while let Some(docs) = results.next().await {
-            let docs = docs.context(error::Fdb {
-                e: "streaming documents from FDB",
-            })?;
-            for doc in docs {
-                let (_space, _db, _collection, _pk, schema_version, versionstamp) =
-                    tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(
-                        doc.key(),
-                    )
-                    .context(error::FdbTupleUnpack)?;
-                let value =
-                    rmpv::decode::read_value(&mut doc.value()).context(error::MPVDecode {
-                        e: "decoding document",
-                    })?;
-                let id = DocID::new(schema_version, versionstamp);
-                if p.execute(&String::from(&id), &value)? {
-                    query_result.push(Document { id, doc: value });
-                }
-                if let Some(l) = limit
-                    && query_result.len() >= l
-                {
-                    return Ok(query_result);
-                }
+        let Some(coll_schema) = schema.collections.get(&collection) else {
+            error::BadRequest {
+                e: "unknown collection",
+            }
+            .fail()?
+        };
+        let plan = match (query, plan) {
+            (None, None) => error::BadRequest {
+                e: "neither plan, nor query were provided",
+            }
+            .fail()?,
+            (None, Some(plan)) => Plan::from_str(&collection, coll_schema, plan)?,
+            (Some(query), _) => Plan::from_query(&collection, coll_schema, query)?,
+        };
+
+        let mut result = plan.execute(&tx);
+        while let Some(doc) = result.next().await {
+            query_result.push(doc?);
+            if let Some(limit) = limit
+                && query_result.len() > limit
+            {
+                break;
             }
         }
-
         Ok(query_result)
     }
 
@@ -319,6 +321,27 @@ impl DB {
                     e: "decoding document",
                 },
             )?)),
+            None => Ok(None),
+        }
+    }
+
+    pub(crate) async fn get_doc_tx(
+        collection: &Collection,
+        id: &DocID,
+        tx: &Transaction,
+    ) -> Result<Option<Document>, AppError> {
+        let key = collection
+            .pk_subspace()
+            .pack(&(id.schema, &id.versionstamp));
+        match tx.get(&key, false).await.context(error::Fdb {
+            e: "reading document",
+        })? {
+            Some(data) => Ok(Some(Document {
+                doc: rmpv::decode::read_value(&mut data.as_ref()).context(MPVDecode {
+                    e: "decoding document",
+                })?,
+                id: id.clone(),
+            })),
             None => Ok(None),
         }
     }
@@ -355,7 +378,7 @@ impl DB {
                     String::from(name),
                     IndexDef {
                         fields: fields.clone(),
-                        ready: false,
+                        ready: true, // TODO: should be false on creation, to be set to true by backfill job
                     },
                 )),
                 &self.fdb,
