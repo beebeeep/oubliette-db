@@ -59,7 +59,7 @@ impl<'a> Fullscan<'a> {
     }
 
     fn execute(&self, tx: &Transaction) -> impl Stream<Item = Result<Document, AppError>> {
-        let opt = RangeOption::from(&self.collection.subspace());
+        let opt = RangeOption::from(&self.collection.pk_subspace());
         tx.get_ranges_keyvalues(opt, false)
             .map_err(|e| AppError::Fdb {
                 e: String::from("scanning collection"),
@@ -117,9 +117,7 @@ impl<'a> IdxScan<'a> {
                 }
             }
             // all predicate fields are found in index, we can use it
-            let mut idx_space = collection
-                .subspace()
-                .subspace(&(schema::KEY_INDEX, idx_name));
+            let mut idx_space = collection.index_subspace(&idx_name);
             for (field, prefix) in def.fields.iter() {
                 let predicate = predicates.iter().find(|p| &p.fld == field).unwrap();
                 let val = match prefix {
@@ -147,7 +145,7 @@ impl<'a> IdxScan<'a> {
         }
 
         return error::BadRequest {
-            e: "idxscan refers to non-indexed fields",
+            e: "idxscan refers to non-indexed fields, or index is not yet ready to use",
         }
         .fail();
     }
@@ -184,6 +182,14 @@ impl<'a> Plan<'a> {
         })?;
 
         Self::from_expr(&plan, collection, schema)
+    }
+
+    pub(crate) fn from_query(
+        _collection: &'a Collection,
+        _schema: &CollectionSchema,
+        _query: &str,
+    ) -> Result<Self, AppError> {
+        whatever!("Query planner is not yet implemented, try querying with plan");
     }
 
     fn from_expr(

@@ -38,7 +38,7 @@ impl Predicate {
         let Some(lhs) = extract_field(&self.fld, &doc.doc) else {
             return false;
         };
-        let rhs = Value::from_ref(&doc.doc);
+        let rhs = &self.val;
 
         match self.rel {
             Relation::Eq => lhs == rhs,
@@ -240,7 +240,13 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
 
 #[cfg(test)]
 mod tests {
-    use crate::expression::{Expression, Predicate, Relation};
+    use serde_json::json;
+
+    use crate::{
+        expression::{Expression, Predicate, Relation},
+        storage::{DocID, Document},
+        values::{Value, json2mp},
+    };
 
     #[test]
     fn parsing() {
@@ -249,26 +255,48 @@ mod tests {
             p,
             Expression::Atomic(Predicate {
                 fld: String::from(".foo"),
-                op: Relation::Eq(Value::from(137)),
-                idx: None,
+                rel: Relation::Eq,
+                val: Value::from(137),
             })
         );
 
-        let p = Expression::try_from(r#"(and (eq .foo 137) (eq .bar "chlos"))"#).unwrap();
+        let p = Expression::try_from(r#"(and (lt .foo 137) (eq .bar "chlos"))"#).unwrap();
         assert_eq!(
             p,
             Expression::And(vec![
                 Expression::Atomic(Predicate {
                     fld: String::from(".foo"),
-                    op: Relation::Eq(Value::from(137)),
-                    idx: None,
+                    rel: Relation::Lt,
+                    val: Value::from(137),
                 }),
                 Expression::Atomic(Predicate {
                     fld: String::from(".bar"),
-                    op: Relation::Eq(Value::from("chlos")),
-                    idx: None,
+                    rel: Relation::Eq,
+                    val: Value::from("chlos"),
                 }),
             ])
         );
+    }
+
+    #[test]
+    fn evaluation() {
+        let p = Expression::try_from("(eq .foo 137)").unwrap();
+        let mut doc = Document {
+            id: DocID::default(),
+            doc: json2mp(json!({})),
+        };
+        assert!(!p.evaluate(&doc));
+
+        doc.doc = json2mp(json!({"foo": 137, "bar": "chlos", "baz": {"baq": 300}}));
+        assert!(p.evaluate(&doc));
+
+        let p = Expression::try_from("(gt .foo 0)").unwrap();
+        assert!(p.evaluate(&doc));
+
+        let p = Expression::try_from("(eq .bar \"chlos\")").unwrap();
+        assert!(p.evaluate(&doc));
+
+        let p = Expression::try_from("(eq .baz.baq 300)").unwrap();
+        assert!(p.evaluate(&doc));
     }
 }

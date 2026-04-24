@@ -111,6 +111,23 @@ impl Collection {
     pub(crate) fn subspace(&self) -> foundationdb::tuple::Subspace {
         Subspace::all().subspace(&(SPACE_DATA, self.db.as_ref(), self.collection.as_ref()))
     }
+    pub(crate) fn pk_subspace(&self) -> foundationdb::tuple::Subspace {
+        Subspace::all().subspace(&(
+            SPACE_DATA,
+            self.db.as_ref(),
+            self.collection.as_ref(),
+            KEY_PK,
+        ))
+    }
+    pub(crate) fn index_subspace(&self, index: &str) -> foundationdb::tuple::Subspace {
+        Subspace::all().subspace(&(
+            SPACE_DATA,
+            self.db.as_ref(),
+            self.collection.as_ref(),
+            KEY_INDEX,
+            index,
+        ))
+    }
 }
 
 impl InstanceSchema {
@@ -150,8 +167,7 @@ impl InstanceSchema {
             SchemaUpdate::UpdateCollection(col) => {
                 current_schema.collections.insert(collection.clone(), col);
             }
-            SchemaUpdate::CreateIndex((name, mut index)) => {
-                index.ready = false;
+            SchemaUpdate::CreateIndex((name, index)) => {
                 let col =
                     current_schema
                         .collections

@@ -100,13 +100,19 @@ impl foundationdb::tuple::TuplePack for Value {
                 if let Some(n) = n.as_u64() {
                     n.pack(w, tuple_depth)
                 } else {
-                    return n.as_i64().unwrap().pack(w, tuple_depth);
+                    return n
+                        .as_i64()
+                        .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidData))?
+                        .pack(w, tuple_depth);
                 }
             }
             rmpv::Value::F32(f) => f.pack(w, tuple_depth),
             rmpv::Value::F64(f) => f.pack(w, tuple_depth),
-            rmpv::Value::String(s) => s.as_str().unwrap().pack(w, tuple_depth),
-            _ => unimplemented!("data type not supported"),
+            rmpv::Value::String(s) => s
+                .as_str()
+                .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidInput))?
+                .pack(w, tuple_depth),
+            _ => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
 }
