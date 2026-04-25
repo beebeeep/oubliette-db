@@ -25,6 +25,33 @@ impl Value {
         }
         Ok(())
     }
+    pub(crate) fn extract_field<'a>(path: &str, value: &'a rmpv::Value) -> Option<&'a Self> {
+        // path looks like .foo.bar.baz, split it by ".", skip 1st part
+        // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
+        // note that document may not contain fields referred by query, that is normal
+        let mut tail = value;
+        for field in path.split(".").skip(1) {
+            if let Some(v) = Self::extract_field_entry(field, tail) {
+                tail = v;
+            } else {
+                return None;
+            }
+        }
+        Some(Value::from_ref(tail))
+    }
+
+    fn extract_field_entry<'a>(entry: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
+        if let rmpv::Value::Map(items) = value {
+            for (k, v) in items {
+                if let Some(s) = k.as_str() {
+                    if s == entry {
+                        return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
 }
 
 impl<T> From<T> for Value
@@ -115,34 +142,6 @@ impl foundationdb::tuple::TuplePack for Value {
             _ => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }
-}
-
-pub(crate) fn extract_field<'a>(path: &str, value: &'a rmpv::Value) -> Option<&'a Value> {
-    // path looks like .foo.bar.baz, split it by ".", skip 1st part
-    // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
-    // note that document may not contain fields referred by query, that is normal
-    let mut tail = value;
-    for field in path.split(".").skip(1) {
-        if let Some(v) = extract_field_entry(field, tail) {
-            tail = v;
-        } else {
-            return None;
-        }
-    }
-    Some(Value::from_ref(tail))
-}
-
-fn extract_field_entry<'a>(entry: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
-    if let rmpv::Value::Map(items) = value {
-        for (k, v) in items {
-            if let Some(s) = k.as_str() {
-                if s == entry {
-                    return Some(v);
-                }
-            }
-        }
-    }
-    None
 }
 
 // todo: put into From<serde_json::Value> for Value?

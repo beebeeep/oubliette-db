@@ -1,13 +1,10 @@
-use std::{collections::HashMap, fmt::Display, sync::LazyLock, time};
+use std::{collections::HashMap, fmt::Display, sync::LazyLock};
 
 use foundationdb::tuple::Subspace;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
 
-use crate::{
-    error::{self, AppError},
-    storage::DocID,
-};
+use crate::error::{self, AppError};
 
 /*
     Key layout:
@@ -52,7 +49,7 @@ pub(crate) struct IndexDef {
     pub(crate) fields: Vec<IndexField>,
     pub(crate) ready: bool,
     pub(crate) lock_timestamp: Option<u128>, // unixtime in ms
-    pub(crate) last_indexed_doc: Option<Vec<u8>>,
+    pub(crate) last_indexed_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
@@ -382,6 +379,8 @@ mod tests {
                             IndexDef {
                                 fields: vec![(String::from(".foo"), Some(0))],
                                 ready: true,
+                                lock_timestamp: None,
+                                last_indexed_key: None,
                             },
                         ),
                         (
@@ -392,6 +391,8 @@ mod tests {
                                     (String::from(".bar.baz"), Some(0)),
                                 ],
                                 ready: true,
+                                lock_timestamp: None,
+                                last_indexed_key: None,
                             },
                         ),
                     ]),

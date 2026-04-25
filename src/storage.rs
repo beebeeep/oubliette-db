@@ -1,90 +1,27 @@
-use std::{collections::HashMap, fmt::Display, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
+    document::{DocID, Document},
     error::{self, AppError, MPVDecode},
     planner::Plan,
     schema::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
         SPACE_DATA, SchemaUpdate, SchemaVersion,
     },
-    values, worker,
+    values::{self, Value},
+    worker,
 };
 use foundationdb::{
-    RangeOption, Transaction,
+    Transaction,
     options::MutationType,
-    tuple::{self, Subspace, Versionstamp},
+    tuple::{Subspace, Versionstamp},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
 
-#[derive(Debug, Clone)]
-pub(crate) struct DocID {
-    schema: SchemaVersion,
-    versionstamp: Versionstamp,
-}
-impl DocID {
-    pub(crate) fn new(schema: SchemaVersion, versionstamp: Versionstamp) -> Self {
-        Self {
-            schema,
-            versionstamp,
-        }
-    }
-}
-
 pub(crate) struct DB {
     fdb: foundationdb::Database,
     schema: Arc<tokio::sync::RwLock<InstanceSchema>>,
-}
-
-pub(crate) struct Document {
-    pub(crate) id: DocID,
-    pub(crate) doc: rmpv::Value,
-}
-
-impl Default for DocID {
-    fn default() -> Self {
-        Self {
-            schema: 0,
-            versionstamp: Versionstamp::from([0u8; 12]),
-        }
-    }
-}
-impl From<&DocID> for String {
-    fn from(d: &DocID) -> Self {
-        let mut s = hex::encode(d.schema.to_le_bytes());
-        s.push_str(&hex::encode(d.versionstamp.as_bytes()));
-        s
-    }
-}
-
-impl Display for DocID {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", String::from(self))
-    }
-}
-
-impl TryFrom<&str> for DocID {
-    type Error = AppError;
-
-    fn try_from(value: &str) -> Result<Self, Self::Error> {
-        if value.len() != 2 * (size_of::<SchemaVersion>() + 12) {
-            return Err(AppError::DocIDDecode {
-                source: hex::FromHexError::InvalidStringLength,
-            });
-        }
-        let schema_bytes: [u8; 4] = hex::decode(&value[..2 * size_of::<SchemaVersion>()])
-            .context(error::DocIDDecode)?
-            .try_into()
-            .unwrap();
-        let vs_bytes: [u8; 12] = hex::decode(&value[2 * size_of::<SchemaVersion>()..])
-            .context(error::DocIDDecode)?
-            .try_into()
-            .unwrap();
-        Ok(Self {
-            schema: SchemaVersion::from_le_bytes(schema_bytes),
-            versionstamp: Versionstamp::from(vs_bytes),
-        })
-    }
 }
 
 impl DB {
@@ -216,7 +153,7 @@ impl DB {
             let mut idx_subspace = collection.subspace().subspace(&(&KEY_INDEX, &index));
             let index_def = indexes.get(&index).expect("index should exist");
             for (field, prefix_len) in &index_def.fields {
-                let Some(value) = values::extract_field(&field, doc) else {
+                let Some(value) = Value::extract_field(&field, doc) else {
                     continue 'NEXT_INDEX;
                 };
                 match value.as_ref() {
@@ -380,25 +317,14 @@ impl DB {
                     String::from(name),
                     IndexDef {
                         fields: fields.clone(),
-                        ready: true, // TODO: should be false on creation, to be set to true by backfill job
+                        ready: false,
                         lock_timestamp: None,
-                        last_indexed_doc: None,
+                        last_indexed_key: None,
                     },
                 )),
                 &self.fdb,
             )
             .await?;
-        Ok(())
-    }
-
-    async fn backfill_index(
-        &self,
-        db: &str,
-        collection: &str,
-        fields: &[IndexField],
-        version: SchemaVersion,
-    ) -> Result<(), AppError> {
-        // TODO: make it background batched job
         Ok(())
     }
 }
@@ -418,7 +344,7 @@ fn dump_key(key: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use crate::storage::DocID;
+    use crate::document::DocID;
 
     #[test]
     fn test_doc_id() {

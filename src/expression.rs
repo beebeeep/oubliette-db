@@ -1,9 +1,8 @@
 use crate::{
+    document::Document,
     error::{self, AppError},
     misc::{assert_len, assert_longer},
-    schema::CollectionSchema,
-    storage::Document,
-    values::{Value, extract_field},
+    values::Value,
 };
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
@@ -35,7 +34,7 @@ pub(crate) struct Predicate {
 
 impl Predicate {
     fn evaluate(&self, doc: &Document) -> bool {
-        let Some(lhs) = extract_field(&self.fld, &doc.doc) else {
+        let Some(lhs) = Value::extract_field(&self.fld, &doc.doc) else {
             return false;
         };
         let rhs = &self.val;
@@ -243,8 +242,8 @@ mod tests {
     use serde_json::json;
 
     use crate::{
+        document::{DocID, Document},
         expression::{Expression, Predicate, Relation},
-        storage::{DocID, Document},
         values::{Value, json2mp},
     };
 

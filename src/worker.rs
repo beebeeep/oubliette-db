@@ -3,9 +3,12 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use foundationdb::RangeOption;
+use futures::StreamExt;
 use snafu::ResultExt;
 
 use crate::{
+    document::Document,
     error::{self, AppError},
     schema::{Collection, IndexDef, InstanceSchema},
 };
@@ -55,6 +58,7 @@ impl Worker {
             .as_millis();
 
         let mut write_schema = false;
+        let schema_version = schema.version;
         for (collection, collection_schema) in schema.collections.iter_mut() {
             for (index_name, index_def) in collection_schema.indexes.iter_mut() {
                 if index_def.ready {
@@ -69,8 +73,18 @@ impl Worker {
                 let db_path = self.db_path.clone();
                 let idx_name = String::from(index_name);
                 let idx_def = index_def.clone();
+                let last_indexed_key = index_def.last_indexed_key.clone();
                 tokio::task::spawn(async move {
-                    if let Err(e) = materialize_index(db_path, coll, idx_name, idx_def).await {
+                    if let Err(e) = materialize_index(
+                        db_path,
+                        schema_version,
+                        coll,
+                        idx_name,
+                        idx_def,
+                        last_indexed_key,
+                    )
+                    .await
+                    {
                         eprintln!("backfill job returned error: {e}");
                     }
                 });
@@ -81,6 +95,7 @@ impl Worker {
 
         if write_schema {
             schema.write_to_db(&tx).await?;
+            tx.commit().await.context(error::FdbTransactionCommit {})?;
         }
 
         Ok(())
@@ -89,11 +104,32 @@ impl Worker {
 
 async fn materialize_index(
     db_path: String,
+    schema_version: u32,
     collection: Collection,
     index_name: String,
     index_def: IndexDef,
+    last_indexed_key: Option<Vec<u8>>,
 ) -> Result<(), AppError> {
     let fdb =
         foundationdb::Database::from_path(&db_path).whatever_context("initializing database")?;
+    let tx = fdb.create_trx().context(error::Fdb {
+        e: "starting transaction",
+    })?;
+    let coll_ss = collection.pk_subspace();
+    let indexed_ss = coll_ss.subspace(&schema_version); // everything right to schema_version is already indexed
+    let range = match last_indexed_key {
+        Some(k) => RangeOption::from((k, indexed_ss.range().0)),
+        None => RangeOption::from((coll_ss.range().0, indexed_ss.range().0)),
+    };
+    let mut results = tx.get_ranges(range, false);
+    while let Some(values) = results.next().await {
+        let values = values.context(error::Fdb {
+            e: "scanning data to index",
+        })?;
+        for value in values {
+            let doc = Document::try_from(value)?;
+        }
+    }
+
     Ok(())
 }
