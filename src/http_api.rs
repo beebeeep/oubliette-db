@@ -112,7 +112,7 @@ pub(crate) async fn collection_query(
         .await?;
     let mut results = Vec::with_capacity(query_result.len());
     for doc in query_result {
-        if let rmpv::Value::Map(mut items) = doc.doc {
+        if let rmpv::Value::Map(mut items) = doc.value {
             items.push((
                 rmpv::Value::from("__id"),
                 rmpv::Value::from(String::from(&doc.id)),

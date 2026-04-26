@@ -2,7 +2,7 @@ use std::fmt::Display;
 
 use foundationdb::{
     future::FdbValue,
-    tuple::{self, Versionstamp},
+    tuple::{self, TuplePack, Versionstamp},
 };
 use snafu::ResultExt;
 
@@ -19,7 +19,7 @@ pub(crate) struct DocID {
 
 pub(crate) struct Document {
     pub(crate) id: DocID,
-    pub(crate) doc: rmpv::Value,
+    pub(crate) value: rmpv::Value,
 }
 
 impl Default for DocID {
@@ -41,6 +41,16 @@ impl From<&DocID> for String {
 impl Display for DocID {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", String::from(self))
+    }
+}
+
+impl TuplePack for DocID {
+    fn pack<W: std::io::Write>(
+        &self,
+        w: &mut W,
+        tuple_depth: tuple::TupleDepth,
+    ) -> std::io::Result<tuple::VersionstampOffset> {
+        (self.schema, &self.versionstamp).pack(w, tuple_depth)
     }
 }
 
@@ -88,7 +98,7 @@ impl TryFrom<FdbValue> for Document {
             .context(error::FdbTupleUnpack)?;
         Ok(Self {
             id: DocID::new(schema_version, versionstamp),
-            doc: rmpv::decode::read_value(&mut value.value().as_ref()).context(MPVDecode {
+            value: rmpv::decode::read_value(&mut value.value().as_ref()).context(MPVDecode {
                 e: "decoding document",
             })?,
         })

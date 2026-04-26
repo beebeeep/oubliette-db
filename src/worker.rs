@@ -5,12 +5,14 @@ use std::{
 
 use foundationdb::RangeOption;
 use futures::StreamExt;
-use snafu::ResultExt;
+use snafu::{ResultExt, whatever};
+use tracing::{debug, error, info};
 
 use crate::{
     document::Document,
     error::{self, AppError},
     schema::{Collection, IndexDef, InstanceSchema},
+    values::Value,
 };
 
 const WORKER_PERIOD: Duration = Duration::from_secs(5);
@@ -27,6 +29,7 @@ impl Worker {
         path: &str,
         schema: Arc<tokio::sync::RwLock<InstanceSchema>>,
     ) -> Result<(), AppError> {
+        info!("starting async worker");
         let fdb =
             foundationdb::Database::from_path(path).whatever_context("initializing database")?;
         let worker = Self {
@@ -37,7 +40,7 @@ impl Worker {
         tokio::task::spawn(async move {
             loop {
                 if let Err(e) = worker.run().await {
-                    eprintln!("worker run error: {e}");
+                    error!(error = format!("{e:?}"), "worker run failed");
                 }
                 tokio::time::sleep(WORKER_PERIOD).await;
             }
@@ -57,7 +60,6 @@ impl Worker {
             .unwrap()
             .as_millis();
 
-        let mut write_schema = false;
         let schema_version = schema.version;
         for (collection, collection_schema) in schema.collections.iter_mut() {
             for (index_name, index_def) in collection_schema.indexes.iter_mut() {
@@ -72,30 +74,13 @@ impl Worker {
                 let coll = collection.clone();
                 let db_path = self.db_path.clone();
                 let idx_name = String::from(index_name);
-                let idx_def = index_def.clone();
-                let last_indexed_key = index_def.last_indexed_key.clone();
                 tokio::task::spawn(async move {
-                    if let Err(e) = materialize_index(
-                        db_path,
-                        schema_version,
-                        coll,
-                        idx_name,
-                        idx_def,
-                        last_indexed_key,
-                    )
-                    .await
+                    if let Err(e) = materialize_index(db_path, schema_version, coll, idx_name).await
                     {
-                        eprintln!("backfill job returned error: {e}");
+                        error!(error = format!("{e:?}"), "backfill job failed");
                     }
                 });
-                index_def.lock_timestamp = Some(current_ts);
-                write_schema = true;
             }
-        }
-
-        if write_schema {
-            schema.write_to_db(&tx).await?;
-            tx.commit().await.context(error::FdbTransactionCommit {})?;
         }
 
         Ok(())
@@ -107,29 +92,99 @@ async fn materialize_index(
     schema_version: u32,
     collection: Collection,
     index_name: String,
-    index_def: IndexDef,
-    last_indexed_key: Option<Vec<u8>>,
 ) -> Result<(), AppError> {
+    info!(index = index_name, "materializing index");
+    let mut doc_count = 0usize;
     let fdb =
         foundationdb::Database::from_path(&db_path).whatever_context("initializing database")?;
+
+    // first, load schema, find the index to materialize and lock it
     let tx = fdb.create_trx().context(error::Fdb {
         e: "starting transaction",
     })?;
-    let coll_ss = collection.pk_subspace();
-    let indexed_ss = coll_ss.subspace(&schema_version); // everything right to schema_version is already indexed
-    let range = match last_indexed_key {
-        Some(k) => RangeOption::from((k, indexed_ss.range().0)),
-        None => RangeOption::from((coll_ss.range().0, indexed_ss.range().0)),
+    let mut schema = InstanceSchema::load(&tx).await?;
+    let Some(collection_schema) = schema.collections.get_mut(&collection) else {
+        whatever!("cannot find schema of collection {collection}");
     };
-    let mut results = tx.get_ranges(range, false);
-    while let Some(values) = results.next().await {
-        let values = values.context(error::Fdb {
-            e: "scanning data to index",
-        })?;
-        for value in values {
-            let doc = Document::try_from(value)?;
+    let Some(index_def) = collection_schema.indexes.get_mut(&index_name) else {
+        whatever!("cannot find index {index_name} in {collection}");
+    };
+    index_def.lock_timestamp = Some(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    );
+    let index_def = index_def.clone();
+    schema.write_to_db(&tx).await?;
+    tx.commit().await.context(error::FdbTransactionCommit {})?;
+
+    // next, materializing the index
+    // TODO: paginate this, transaction should not be too big and too long.
+    // Should set last_indexed_key, commit and restart transaction.
+    let tx = fdb.create_trx().context(error::Fdb {
+        e: "starting transaction",
+    })?;
+    {
+        let coll_ss = collection.pk_subspace();
+        let indexed_ss = coll_ss.subspace(&schema_version); // everything right to schema_version is already indexed
+        let range = match index_def.last_indexed_key {
+            Some(k) => RangeOption::from((k, indexed_ss.range().0)),
+            None => RangeOption::from((coll_ss.range().0, indexed_ss.range().0)),
+        };
+        let mut results = tx.get_ranges(range, false);
+        while let Some(values) = results.next().await {
+            let values = values.context(error::Fdb {
+                e: "scanning data to index",
+            })?;
+            'VALUES: for value in values {
+                doc_count += 1;
+                let doc = Document::try_from(value)?;
+                let mut index_ss = collection.index_subspace(&index_name);
+
+                // construct index key by appending all indexed field values to the root index key
+                for field in index_def.fields.iter() {
+                    let Some(value) = Value::extract_field(&field.0, &doc.value) else {
+                        continue 'VALUES;
+                    };
+                    index_ss = match (value, field.1) {
+                        (Value(rmpv::Value::String(s)), Some(prefix)) => {
+                            let Some(s) = s.as_str() else {
+                                continue 'VALUES;
+                            };
+                            let s = &s[..s.floor_char_boundary(prefix)];
+                            index_ss.subspace(&s)
+                        }
+                        (v, _) => index_ss.subspace(v),
+                    };
+                }
+
+                let key = index_ss.pack(&doc.id);
+                tx.set(&key, &[]);
+            }
         }
     }
+
+    // materialization done, unlock index and enable it.
+    let mut schema = InstanceSchema::load(&tx).await?;
+    {
+        let Some(collection_schema) = schema.collections.get_mut(&collection) else {
+            whatever!("cannot find schema of collection {collection}");
+        };
+        let Some(index_schema) = collection_schema.indexes.get_mut(&index_name) else {
+            whatever!("cannot find index {index_name} in {collection}");
+        };
+        index_schema.ready = true;
+        index_schema.lock_timestamp = None;
+    }
+    schema.write_to_db(&tx).await?;
+
+    tx.commit().await.context(error::FdbTransactionCommit {})?;
+    info!(
+        index = index_name,
+        document_count = doc_count,
+        "index successfully materialized"
+    );
 
     Ok(())
 }

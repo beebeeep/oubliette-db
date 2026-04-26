@@ -150,44 +150,45 @@ impl DB {
         doc: &rmpv::Value,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
-            let mut idx_subspace = collection.subspace().subspace(&(&KEY_INDEX, &index));
+            let mut idx_subspace = collection.index_subspace(&index);
             let index_def = indexes.get(&index).expect("index should exist");
             for (field, prefix_len) in &index_def.fields {
                 let Some(value) = Value::extract_field(&field, doc) else {
                     continue 'NEXT_INDEX;
                 };
-                match value.as_ref() {
-                    rmpv::Value::Boolean(b) => {
-                        idx_subspace = idx_subspace.subspace(b);
-                    }
-                    rmpv::Value::F32(f) => {
-                        idx_subspace = idx_subspace.subspace(f);
-                    }
-                    rmpv::Value::F64(f) => {
-                        idx_subspace = idx_subspace.subspace(f);
-                    }
-                    rmpv::Value::Integer(n) => {
-                        if let Some(n) = n.as_u64() {
-                            idx_subspace = idx_subspace.subspace(&n);
-                        }
-                        if let Some(n) = n.as_i64() {
-                            idx_subspace = idx_subspace.subspace(&n);
-                        }
-                    }
-                    rmpv::Value::String(s) => {
-                        if let Some(mut s) = s.as_str() {
-                            if let Some(prefix_len) = prefix_len {
-                                s = &s[..s.floor_char_boundary(*prefix_len)]
-                            }
-                            idx_subspace = idx_subspace.subspace(&s);
-                        } else {
-                            continue 'NEXT_INDEX;
-                        }
-                    }
-                    _ => {
-                        continue 'NEXT_INDEX;
-                    }
-                };
+                idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
+                // match value.as_ref() {
+                //     rmpv::Value::Boolean(b) => {
+                //         idx_subspace = idx_subspace.subspace(b);
+                //     }
+                //     rmpv::Value::F32(f) => {
+                //         idx_subspace = idx_subspace.subspace(f);
+                //     }
+                //     rmpv::Value::F64(f) => {
+                //         idx_subspace = idx_subspace.subspace(f);
+                //     }
+                //     rmpv::Value::Integer(n) => {
+                //         if let Some(n) = n.as_u64() {
+                //             idx_subspace = idx_subspace.subspace(&n);
+                //         }
+                //         if let Some(n) = n.as_i64() {
+                //             idx_subspace = idx_subspace.subspace(&n);
+                //         }
+                //     }
+                //     rmpv::Value::String(s) => {
+                //         if let Some(mut s) = s.as_str() {
+                //             if let Some(prefix_len) = prefix_len {
+                //                 s = &s[..s.floor_char_boundary(*prefix_len)]
+                //             }
+                //             idx_subspace = idx_subspace.subspace(&s);
+                //         } else {
+                //             continue 'NEXT_INDEX;
+                //         }
+                //     }
+                //     _ => {
+                //         continue 'NEXT_INDEX;
+                //     }
+                // };
             }
             let key = idx_subspace
                 .pack_with_versionstamp(&(schema_version, &Versionstamp::incomplete(0)));
@@ -276,7 +277,7 @@ impl DB {
             e: "reading document",
         })? {
             Some(data) => Ok(Some(Document {
-                doc: rmpv::decode::read_value(&mut data.as_ref()).context(MPVDecode {
+                value: rmpv::decode::read_value(&mut data.as_ref()).context(MPVDecode {
                     e: "decoding document",
                 })?,
                 id: id.clone(),

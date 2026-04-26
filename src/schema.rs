@@ -3,6 +3,7 @@ use std::{collections::HashMap, fmt::Display, sync::LazyLock};
 use foundationdb::tuple::Subspace;
 use serde::{Deserialize, Serialize};
 use snafu::{OptionExt, ResultExt};
+use tracing::info;
 
 use crate::error::{self, AppError};
 
@@ -167,9 +168,20 @@ impl InstanceSchema {
 
         match schema_update {
             SchemaUpdate::UpdateCollection(col) => {
+                info!(
+                    db = collection.db,
+                    collection = collection.collection,
+                    "updating collection schema"
+                );
                 current_schema.collections.insert(collection.clone(), col);
             }
             SchemaUpdate::CreateIndex((name, index)) => {
+                info!(
+                    db = collection.db,
+                    collection = collection.collection,
+                    index = name,
+                    "creating new index"
+                );
                 let col =
                     current_schema
                         .collections

@@ -34,7 +34,7 @@ pub(crate) struct Predicate {
 
 impl Predicate {
     fn evaluate(&self, doc: &Document) -> bool {
-        let Some(lhs) = Value::extract_field(&self.fld, &doc.doc) else {
+        let Some(lhs) = Value::extract_field(&self.fld, &doc.value) else {
             return false;
         };
         let rhs = &self.val;
@@ -282,11 +282,11 @@ mod tests {
         let p = Expression::try_from("(eq .foo 137)").unwrap();
         let mut doc = Document {
             id: DocID::default(),
-            doc: json2mp(json!({})),
+            value: json2mp(json!({})),
         };
         assert!(!p.evaluate(&doc));
 
-        doc.doc = json2mp(json!({"foo": 137, "bar": "chlos", "baz": {"baq": 300}}));
+        doc.value = json2mp(json!({"foo": 137, "bar": "chlos", "baz": {"baq": 300}}));
         assert!(p.evaluate(&doc));
 
         let p = Expression::try_from("(gt .foo 0)").unwrap();
