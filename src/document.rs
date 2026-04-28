@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use foundationdb::{
-    future::FdbValue,
+    future::{FdbKeyValue, FdbValue},
     tuple::{self, TuplePack, Versionstamp},
 };
 use snafu::ResultExt;
@@ -87,10 +87,29 @@ impl DocID {
     }
 }
 
-impl TryFrom<FdbValue> for Document {
+/*
+impl TryFrom<&FdbKeyValue> for Document {
     type Error = AppError;
 
-    fn try_from(value: FdbValue) -> Result<Self, Self::Error> {
+    fn try_from(value: &FdbKeyValue) -> Result<Self, Self::Error> {
+        let (_space, _db, _collection, _pk, schema_version, versionstamp) =
+            tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(
+                value.key(),
+            )
+            .context(error::FdbTupleUnpack)?;
+        Ok(Self {
+            id: DocID::new(schema_version, versionstamp),
+            value: rmpv::decode::read_value(&mut value.value().as_ref()).context(MPVDecode {
+                e: "decoding document",
+            })?,
+        })
+    }
+}*/
+
+impl TryFrom<&FdbValue> for Document {
+    type Error = AppError;
+
+    fn try_from(value: &FdbValue) -> Result<Self, Self::Error> {
         let (_space, _db, _collection, _pk, schema_version, versionstamp) =
             tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(
                 value.key(),
