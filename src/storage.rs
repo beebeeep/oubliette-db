@@ -156,6 +156,7 @@ impl DB {
                 let Some(value) = Value::extract_field(&field, doc) else {
                     continue 'NEXT_INDEX;
                 };
+                // TODO: truncate string value to prefix_len
                 idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
                 // match value.as_ref() {
                 //     rmpv::Value::Boolean(b) => {
