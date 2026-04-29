@@ -1,75 +1,107 @@
 use std::sync::Arc;
 
 use crate::{
-    error::AppError,
+    error::{self, AppError},
     storage,
-    values::{json2mp, mp2json},
+    values::{Value, json2mp, mp2json},
 };
 use axum::{
+    Router,
     body::Bytes,
     extract::{Json, Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    routing::{get, patch, post, put},
 };
 use serde::{Deserialize, Serialize};
+use snafu::ResultExt;
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct QueryRequest {
-    query: Option<Box<str>>,
-    plan: Option<Box<str>>,
-    limit: Option<usize>,
+    pub query: Option<Box<str>>,
+    pub plan: Option<Box<str>>,
+    pub limit: Option<usize>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct QueryResponse {
     results: Vec<serde_json::Value>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UpdateRequest {}
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct UpdateResponse {}
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SetRequest {
-    doc: serde_json::Value,
+    pub docs: Vec<serde_json::Value>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct SetResponse {
-    id: Box<str>,
+    pub ids: Vec<Box<str>>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct IndexField {
-    field: Box<str>,
-    prefix_length: Option<usize>,
+    pub field: Box<str>,
+    pub prefix_length: Option<usize>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AddIndexRequest {
-    name: Box<str>,
-    fields: Vec<IndexField>,
+    pub name: Box<str>,
+    pub fields: Vec<IndexField>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct AddIndexResponse {}
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CreateCollectionRequest {}
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct CreateCollectionResponse {}
 
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
 pub struct GetDocResponse {
-    doc: Option<serde_json::Value>,
+    pub doc: Option<serde_json::Value>,
 }
 
-pub struct AppState {
-    pub db: storage::DB,
+struct AppState {
+    db: storage::DB,
+}
+
+pub async fn start(db_path: &str) -> Result<(), AppError> {
+    // safety: we drop network at the end of main
+    let network = unsafe { foundationdb::boot() };
+    let db = storage::DB::from_path(db_path).await?;
+    let state = Arc::new(AppState { db });
+
+    let app = Router::new()
+        .route("/fdb/{key}", get(fdb_get))
+        .route("/fdb/{key}", put(fdb_set))
+        .route("/{db}/{collection}/{doc_id}", get(collection_get_doc))
+        .route("/{db}/{collection}", post(collection_query))
+        .route("/{db}/{collection}", put(collection_set))
+        .route("/{db}/{collection}", patch(collection_update))
+        .route("/_manage/{db}/{collection}/create", post(create_collection))
+        .route("/_manage/{db}/{collection}/create_index", post(add_index))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("localhost:4800")
+        .await
+        .whatever_context("binding port")?;
+    axum::serve(listener, app)
+        .await
+        .whatever_context("running the server")?;
+
+    drop(network);
+    Ok(())
 }
 
 /// sets raw key in FDB
-pub async fn fdb_set(
+async fn fdb_set(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
     body: Bytes,
@@ -78,14 +110,14 @@ pub async fn fdb_set(
 }
 
 /// returns raw key from FDB
-pub async fn fdb_get(
+async fn fdb_get(
     State(state): State<Arc<AppState>>,
     Path(key): Path<String>,
 ) -> Result<Box<[u8]>, AppError> {
     state.db.fdb_get(key.as_bytes()).await
 }
 
-pub(crate) async fn collection_get_doc(
+async fn collection_get_doc(
     State(state): State<Arc<AppState>>,
     Path((db, collection, doc_id)): Path<(String, String, String)>,
 ) -> Result<Json<GetDocResponse>, AppError> {
@@ -95,7 +127,7 @@ pub(crate) async fn collection_get_doc(
     }))
 }
 
-pub(crate) async fn collection_query(
+async fn collection_query(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<QueryRequest>,
@@ -123,22 +155,25 @@ pub(crate) async fn collection_query(
     Ok(Json(QueryResponse { results }))
 }
 
-pub(crate) async fn collection_set(
+async fn collection_set(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<SetRequest>,
-) -> Result<Json<SetResponse>, AppError> {
-    let id = state
-        .db
-        .insert_doc(&db, &collection, json2mp(req.doc))
-        .await?;
+) -> Result<impl IntoResponse, AppError> {
+    let docs: Vec<rmpv::Value> = req.docs.into_iter().map(|v| json2mp(v)).collect();
+    let mut ids = Vec::with_capacity(docs.len());
+    for doc in docs {
+        ids.push(state.db.insert_doc(&db, &collection, doc).await?);
+    }
 
-    Ok(Json(SetResponse {
-        id: String::from(&id).into_boxed_str(),
-    }))
+    let ids = ids
+        .into_iter()
+        .map(|id| String::from(&id).into_boxed_str())
+        .collect();
+    Ok((StatusCode::CREATED, Json(SetResponse { ids })))
 }
 
-pub(crate) async fn create_collection(
+async fn create_collection(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
     Json(_req): Json<CreateCollectionRequest>,
@@ -147,7 +182,7 @@ pub(crate) async fn create_collection(
     Ok(Json(CreateCollectionResponse {}))
 }
 
-pub(crate) async fn add_index(
+async fn add_index(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<AddIndexRequest>,
@@ -164,7 +199,7 @@ pub(crate) async fn add_index(
     Ok(Json(AddIndexResponse {}))
 }
 
-pub(crate) async fn collection_update(
+async fn collection_update(
     State(state): State<Arc<AppState>>,
     Path(db): Path<String>,
     Path(collection): Path<String>,

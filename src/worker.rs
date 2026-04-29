@@ -12,11 +12,11 @@ use crate::{
     document::Document,
     error::{self, AppError},
     schema::{Collection, IndexDef, InstanceSchema},
-    values::Value,
 };
 
 const WORKER_PERIOD: Duration = Duration::from_secs(5);
 const INDEXER_TIMEOUT: u128 = 10000; // 10 seconds
+const MAX_OPS_PER_TX: usize = 10000;
 
 pub(crate) struct Worker {
     fdb: foundationdb::Database,
@@ -94,97 +94,97 @@ async fn materialize_index(
     index_name: String,
 ) -> Result<(), AppError> {
     info!(index = index_name, "materializing index");
-    let mut doc_count = 0usize;
     let fdb =
         foundationdb::Database::from_path(&db_path).whatever_context("initializing database")?;
 
-    // first, load schema, find the index to materialize and lock it
-    let tx = fdb.create_trx().context(error::Fdb {
-        e: "starting transaction",
-    })?;
-    let mut schema = InstanceSchema::load(&tx).await?;
-    let Some(collection_schema) = schema.collections.get_mut(&collection) else {
-        whatever!("cannot find schema of collection {collection}");
-    };
-    let Some(index_def) = collection_schema.indexes.get_mut(&index_name) else {
-        whatever!("cannot find index {index_name} in {collection}");
-    };
-    index_def.lock_timestamp = Some(
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_millis(),
-    );
-    let index_def = index_def.clone();
-    schema.write_to_db(&tx).await?;
-    tx.commit().await.context(error::FdbTransactionCommit {})?;
-
-    // next, materializing the index
-    // TODO: paginate this, transaction should not be too big and too long.
-    // Should set last_indexed_key, commit and restart transaction.
-    let tx = fdb.create_trx().context(error::Fdb {
-        e: "starting transaction",
-    })?;
-    {
-        let coll_ss = collection.pk_subspace();
-        let indexed_ss = coll_ss.subspace(&schema_version); // everything right to schema_version is already indexed
-        let range = match index_def.last_indexed_key {
-            Some(k) => RangeOption::from((k, indexed_ss.range().0)),
-            None => RangeOption::from((coll_ss.range().0, indexed_ss.range().0)),
+    let mut total_doc_count = 0usize;
+    loop {
+        // first, load schema, find the index to materialize and lock it
+        let tx = fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let mut schema = InstanceSchema::load(&tx).await?;
+        let Some(collection_schema) = schema.collections.get_mut(&collection) else {
+            whatever!("cannot find schema of collection {collection}")
         };
-        let mut results = tx.get_ranges(range, false);
-        while let Some(values) = results.next().await {
-            let values = values.context(error::Fdb {
-                e: "scanning data to index",
-            })?;
-            'VALUES: for value in values {
-                doc_count += 1;
-                let doc = Document::try_from(value)?;
-                let mut index_ss = collection.index_subspace(&index_name);
+        let Some(index_def) = collection_schema.indexes.get_mut(&index_name) else {
+            whatever!("cannot find index {index_name} in {collection}");
+        };
 
-                // construct index key by appending all indexed field values to the root index key
-                for field in index_def.fields.iter() {
-                    let Some(value) = Value::extract_field(&field.0, &doc.value) else {
-                        continue 'VALUES;
-                    };
-                    index_ss = match (value, field.1) {
-                        (Value(rmpv::Value::String(s)), Some(prefix)) => {
-                            let Some(s) = s.as_str() else {
-                                continue 'VALUES;
-                            };
-                            let s = &s[..s.floor_char_boundary(prefix)];
-                            index_ss.subspace(&s)
-                        }
-                        (v, _) => index_ss.subspace(v),
-                    };
-                }
+        // next, materializing the index
+        let tx = fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let (done, doc_count, last_indexed_key) =
+            materialize_index_batch(&collection, index_def, &index_name, schema_version, &tx)
+                .await?;
+        total_doc_count += doc_count;
 
-                let key = index_ss.pack(&doc.id);
-                tx.set(&key, &[]);
+        if done {
+            index_def.ready = true;
+            index_def.lock_timestamp = None;
+            index_def.last_indexed_key = None;
+        } else {
+            debug!(
+                index = index_name,
+                document_count = total_doc_count,
+                "index materialization is in progress"
+            );
+            index_def.lock_timestamp = Some(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis(),
+            );
+            index_def.last_indexed_key = last_indexed_key;
+        }
+        schema.write_to_db(&tx).await?;
+        tx.commit().await.context(error::FdbTransactionCommit {})?;
+        if done {
+            info!(
+                index = index_name,
+                document_count = total_doc_count,
+                "index was successfully materialized"
+            );
+            return Ok(());
+        }
+    }
+}
+
+async fn materialize_index_batch(
+    collection: &Collection,
+    index_def: &IndexDef,
+    index_name: &str,
+    schema_version: u32,
+    tx: &foundationdb::Transaction,
+) -> Result<(bool, usize, Option<Vec<u8>>), AppError> {
+    let coll_ss = collection.pk_subspace();
+    let indexed_ss = coll_ss.subspace(&schema_version); // everything right to schema_version is already indexed
+    let range = match &index_def.last_indexed_key {
+        Some(k) => RangeOption::from((k.clone(), indexed_ss.range().0)),
+        None => RangeOption::from((coll_ss.range().0, indexed_ss.range().0)),
+    };
+    let mut results = tx.get_ranges(range, false);
+    let mut doc_count = 0usize;
+
+    while let Some(values) = results.next().await {
+        let values = values.context(error::Fdb {
+            e: "scanning data to index",
+        })?;
+        'VALUES: for value in values.iter() {
+            let doc = Document::try_from(value)?;
+            let index_ss = collection.index_subspace(&index_name);
+
+            // construct index key by appending all indexed field values to the root index key
+            let Some(key) = index_def.get_key(index_ss, &doc) else {
+                continue 'VALUES;
+            };
+            tx.set(&key, &[]);
+            doc_count += 1;
+            if doc_count > MAX_OPS_PER_TX {
+                return Ok((false, doc_count, Some(Vec::from(value.key()))));
             }
         }
     }
-
-    // materialization done, unlock index and enable it.
-    let mut schema = InstanceSchema::load(&tx).await?;
-    {
-        let Some(collection_schema) = schema.collections.get_mut(&collection) else {
-            whatever!("cannot find schema of collection {collection}");
-        };
-        let Some(index_schema) = collection_schema.indexes.get_mut(&index_name) else {
-            whatever!("cannot find index {index_name} in {collection}");
-        };
-        index_schema.ready = true;
-        index_schema.lock_timestamp = None;
-    }
-    schema.write_to_db(&tx).await?;
-
-    tx.commit().await.context(error::FdbTransactionCommit {})?;
-    info!(
-        index = index_name,
-        document_count = doc_count,
-        "index successfully materialized"
-    );
-
-    Ok(())
+    Ok((true, doc_count, None))
 }

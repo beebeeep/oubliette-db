@@ -1,7 +1,7 @@
 use std::fmt::Display;
 
 use foundationdb::{
-    future::FdbValue,
+    future::{FdbKeyValue, FdbValue},
     tuple::{self, TuplePack, Versionstamp},
 };
 use snafu::ResultExt;
@@ -87,18 +87,32 @@ impl DocID {
     }
 }
 
+impl TryFrom<&FdbKeyValue> for Document {
+    type Error = AppError;
+
+    fn try_from(value: &FdbKeyValue) -> Result<Self, Self::Error> {
+        Self::try_from((value.key(), value.value()))
+    }
+}
+
 impl TryFrom<FdbValue> for Document {
     type Error = AppError;
 
     fn try_from(value: FdbValue) -> Result<Self, Self::Error> {
+        Self::try_from((value.key(), value.value()))
+    }
+}
+
+impl TryFrom<(&[u8], &[u8])> for Document {
+    type Error = AppError;
+
+    fn try_from(kv: (&[u8], &[u8])) -> Result<Self, Self::Error> {
         let (_space, _db, _collection, _pk, schema_version, versionstamp) =
-            tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(
-                value.key(),
-            )
-            .context(error::FdbTupleUnpack)?;
+            tuple::unpack::<(String, String, String, String, SchemaVersion, Versionstamp)>(kv.0)
+                .context(error::FdbTupleUnpack)?;
         Ok(Self {
             id: DocID::new(schema_version, versionstamp),
-            value: rmpv::decode::read_value(&mut value.value().as_ref()).context(MPVDecode {
+            value: rmpv::decode::read_value(&mut kv.1.as_ref()).context(MPVDecode {
                 e: "decoding document",
             })?,
         })

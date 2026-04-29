@@ -2,10 +2,14 @@ use std::{collections::HashMap, fmt::Display, sync::LazyLock};
 
 use foundationdb::tuple::Subspace;
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt};
+use snafu::{OptionExt, ResultExt, whatever};
 use tracing::info;
 
-use crate::error::{self, AppError};
+use crate::{
+    document::Document,
+    error::{self, AppError},
+    values::Value,
+};
 
 /*
     Key layout:
@@ -81,6 +85,25 @@ impl IndexDef {
     fn contains(&self, field: &str) -> bool {
         self.fields.iter().any(|(idx_field, _)| idx_field == field)
     }
+
+    pub(crate) fn get_key(&self, mut subspace: Subspace, doc: &Document) -> Option<Vec<u8>> {
+        for field in self.fields.iter() {
+            let Some(value) = Value::extract_field(&field.0, &doc.value) else {
+                return None;
+            };
+            subspace = match (value, field.1) {
+                (Value(rmpv::Value::String(s)), Some(prefix)) => {
+                    let Some(s) = s.as_str() else {
+                        return None;
+                    };
+                    let s = &s[..s.floor_char_boundary(prefix)];
+                    subspace.subspace(&s)
+                }
+                (v, _) => subspace.subspace(v),
+            };
+        }
+        Some(subspace.pack(&doc.id))
+    }
 }
 
 impl Display for Collection {
@@ -147,6 +170,24 @@ impl InstanceSchema {
             None => Self::default(),
         };
         Ok(schema)
+    }
+
+    pub(crate) fn update_index<F>(
+        &mut self,
+        collection: &Collection,
+        index_name: &str,
+        update: F,
+    ) -> Result<(), AppError>
+    where
+        F: FnOnce(&mut IndexDef) -> Result<(), AppError>,
+    {
+        let Some(collection_schema) = self.collections.get_mut(collection) else {
+            whatever!("cannot find schema of collection {collection}")
+        };
+        let Some(index_def) = collection_schema.indexes.get_mut(index_name) else {
+            whatever!("cannot find index {index_name} in {collection}");
+        };
+        update(index_def)
     }
 
     pub(crate) async fn apply_schema_update(
