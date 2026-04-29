@@ -6,13 +6,12 @@ use std::{
 use foundationdb::RangeOption;
 use futures::StreamExt;
 use snafu::{ResultExt, whatever};
-use tracing::{debug, error, info};
+use tracing::{error, info};
 
 use crate::{
     document::Document,
     error::{self, AppError},
     schema::{Collection, IndexDef, InstanceSchema},
-    values::Value,
 };
 
 const WORKER_PERIOD: Duration = Duration::from_secs(5);
