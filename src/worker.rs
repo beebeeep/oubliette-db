@@ -6,7 +6,7 @@ use std::{
 use foundationdb::RangeOption;
 use futures::StreamExt;
 use snafu::{ResultExt, whatever};
-use tracing::{error, info};
+use tracing::{debug, error, info};
 
 use crate::{
     document::Document,
@@ -121,9 +121,15 @@ async fn materialize_index(
         total_doc_count += doc_count;
 
         if done {
+            index_def.ready = true;
             index_def.lock_timestamp = None;
             index_def.last_indexed_key = None;
         } else {
+            debug!(
+                index = index_name,
+                document_count = total_doc_count,
+                "index materialization is in progress"
+            );
             index_def.lock_timestamp = Some(
                 SystemTime::now()
                     .duration_since(UNIX_EPOCH)
