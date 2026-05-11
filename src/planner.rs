@@ -36,6 +36,7 @@ pub(crate) struct Filter<'a> {
 pub(crate) struct IdxScan<'a> {
     collection: &'a Collection,
     idx_space: Subspace,
+    range: RangeOption,
     // TODO: add extra filter here to support range scans over composite indexes:
     // Suppose (foo, bar) is index, and query is (and (gt .foo 300) (le .bar 200))
     // Scan takes continious subrange where .foo > 300 and can select only those index entries
@@ -117,7 +118,9 @@ impl<'a> IdxScan<'a> {
                     crate::expression::Relation::Eq => {
                         idx_space = idx_space.subspace(&val);
                     }
-                    crate::expression::Relation::Gt => todo!("relation unsupported"),
+                    crate::expression::Relation::Gt => {
+                        idx_space = 
+                    }
                     crate::expression::Relation::Ge => todo!("relation unsupported"),
                     crate::expression::Relation::Lt => todo!("relation unsupported"),
                     crate::expression::Relation::Le => todo!("relation unsupported"),
