@@ -1,10 +1,10 @@
 use foundationdb::{
-    RangeOption, Transaction,
+    KeySelector, RangeOption, Transaction,
     tuple::{Subspace, Versionstamp},
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use sexpression::Expression as Sexpr;
-use snafu::{ResultExt, whatever};
+use snafu::{OptionExt, ResultExt, whatever};
 
 use crate::{
     document::{DocID, Document},
@@ -13,6 +13,7 @@ use crate::{
     misc::{assert_len, assert_longer},
     schema::{Collection, CollectionSchema, SchemaVersion},
     storage::DB,
+    values::Value,
 };
 
 /// DocumentStream is stream produced by Plan. Due to recursive nature of Plan type,
@@ -35,8 +36,8 @@ pub(crate) struct Filter<'a> {
 
 pub(crate) struct IdxScan<'a> {
     collection: &'a Collection,
-    idx_space: Subspace,
-    range: RangeOption,
+    idx_subspace: Subspace,
+    range: RangeOption<'a>,
     // TODO: add extra filter here to support range scans over composite indexes:
     // Suppose (foo, bar) is index, and query is (and (gt .foo 300) (le .bar 200))
     // Scan takes continious subrange where .foo > 300 and can select only those index entries
@@ -80,6 +81,91 @@ impl<'a> IdxScan<'a> {
         collection: &'a Collection,
         schema: &CollectionSchema,
     ) -> Result<Self, AppError> {
+        let Sexpr::Symbol(idx_name) = exprs[0] else {
+            return error::BadRequest {
+                e: "invalid ixscan expression, index name is expected",
+            }
+            .fail();
+        };
+        let index = schema.indexes.get(idx_name).context(error::BadRequest {
+            e: format!("unknown index {idx_name}"),
+        })?;
+        if !index.ready {
+            return error::BadRequest {
+                e: format!("index {idx_name} is not yet ready to use"),
+            }
+            .fail();
+        }
+
+        match (exprs.get(1), exprs.get(2), exprs.get(3)) {
+            (Some(Sexpr::Symbol(op)), Some(Sexpr::List(op_values)), None) => {
+                let (idx_space_begin, idx_space_end) = collection.index_subspace(idx_name).range();
+                let mut idx_subspace = collection.index_subspace(idx_name);
+                if index.fields.len() != op_values.len() {
+                    return error::BadRequest {
+                        e: format!(
+                            "index {idx_name} has {} fields, {} values given",
+                            index.fields.len(),
+                            op_values.len()
+                        ),
+                    }
+                    .fail();
+                }
+                for value in op_values {
+                    idx_subspace = idx_subspace.subspace(&Value::from_sexpr(value)?);
+                }
+
+                let (first, last) = idx_subspace.range();
+                let range = match *op {
+                    "eq" => RangeOption::from(&idx_subspace),
+                    "ge" => RangeOption {
+                        begin: KeySelector::first_greater_or_equal(last),
+                        end: KeySelector::last_less_than(idx_space_end),
+                        ..Default::default()
+                    },
+                    "gt" => RangeOption {
+                        begin: KeySelector::first_greater_than(last),
+                        end: KeySelector::last_less_than(idx_space_end),
+                        ..Default::default()
+                    },
+                    "le" => RangeOption {
+                        begin: KeySelector::first_greater_than(idx_space_begin),
+                        end: KeySelector::last_less_or_equal(first),
+                        ..Default::default()
+                    },
+                    "lt" => RangeOption {
+                        begin: KeySelector::first_greater_than(idx_space_begin),
+                        end: KeySelector::last_less_than(first),
+                        ..Default::default()
+                    },
+                    v => {
+                        return error::BadRequest {
+                            e: format!("invalid ixscan operation {v}"),
+                        }
+                        .fail();
+                    }
+                };
+                return Ok(Self {
+                    collection,
+                    idx_subspace,
+                    range,
+                });
+            }
+            (
+                Some(Sexpr::Symbol(range_op)),
+                Some(Sexpr::List(left_values)),
+                Some(Sexpr::List(right_values)),
+            ) => {
+                todo!();
+            }
+            _ => {
+                return error::BadRequest {
+                    e: format!("invalid ixscan for index {idx_name}"),
+                }
+                .fail();
+            }
+        };
+        /*
         let mut predicates = Vec::with_capacity(exprs.len());
         for expr in exprs {
             let expr = Expression::try_from(expr)?;
@@ -119,7 +205,7 @@ impl<'a> IdxScan<'a> {
                         idx_space = idx_space.subspace(&val);
                     }
                     crate::expression::Relation::Gt => {
-                        idx_space = 
+                        idx_space =
                     }
                     crate::expression::Relation::Ge => todo!("relation unsupported"),
                     crate::expression::Relation::Lt => todo!("relation unsupported"),
@@ -135,19 +221,19 @@ impl<'a> IdxScan<'a> {
         return error::BadRequest {
             e: "idxscan refers to non-indexed fields, or index is not yet ready to use",
         }
-        .fail();
+        .fail(); */
     }
 
-    fn execute(&self, tx: &Transaction) -> impl Stream<Item = Result<Document, AppError>> {
-        let opt = RangeOption::from(&self.idx_space);
-        tx.get_ranges_keyvalues(opt, false)
+    fn execute(&self, tx: &'a Transaction) -> impl Stream<Item = Result<Document, AppError>> {
+        // let range = RangeOption::from(&self.idx_subspace);
+        tx.get_ranges_keyvalues(self.range.clone(), false)
             .map_err(|e| AppError::Fdb {
                 e: String::from("scanning index"),
                 source: e,
             })
             .try_filter_map(async |value| {
                 let (schema_version, versionstamp) = self
-                    .idx_space
+                    .idx_subspace
                     .unpack::<(SchemaVersion, Versionstamp)>(value.key())
                     .context(error::FdbTupleUnpack)?;
                 let doc_id = DocID::new(schema_version, versionstamp);
@@ -202,7 +288,7 @@ impl<'a> Plan<'a> {
         match list.get(0) {
             Some(Sexpr::Symbol(op)) => match *op {
                 "ixscan" => {
-                    assert_longer(&list, 1)?;
+                    assert_longer(&list, 4)?;
                     Ok(Self::IdxScan(IdxScan::from_exprs(
                         &list[1..],
                         collection,
