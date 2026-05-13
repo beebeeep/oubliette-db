@@ -1,10 +1,11 @@
 use foundationdb::{
     KeySelector, RangeOption, Transaction,
-    tuple::{Subspace, Versionstamp},
+    tuple::{self, Subspace, Versionstamp},
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use sexpression::Expression as Sexpr;
 use snafu::{OptionExt, ResultExt, whatever};
+use tracing::debug;
 
 use crate::{
     document::{DocID, Document},
@@ -36,7 +37,6 @@ pub(crate) struct Filter<'a> {
 
 pub(crate) struct IdxScan<'a> {
     collection: &'a Collection,
-    idx_subspace: Subspace,
     range: RangeOption<'a>,
     // TODO: add extra filter here to support range scans over composite indexes:
     // Suppose (foo, bar) is index, and query is (and (gt .foo 300) (le .bar 200))
@@ -99,6 +99,7 @@ impl<'a> IdxScan<'a> {
 
         match (exprs.get(1), exprs.get(2), exprs.get(3)) {
             (Some(Sexpr::Symbol(op)), Some(Sexpr::List(op_values)), None) => {
+                // (ixscan idx_name eq (137 "foo"))
                 let (idx_space_begin, idx_space_end) = collection.index_subspace(idx_name).range();
                 let mut idx_subspace = collection.index_subspace(idx_name);
                 if index.fields.len() != op_values.len() {
@@ -145,18 +146,59 @@ impl<'a> IdxScan<'a> {
                         .fail();
                     }
                 };
-                return Ok(Self {
-                    collection,
-                    idx_subspace,
-                    range,
-                });
+                return Ok(Self { collection, range });
             }
             (
-                Some(Sexpr::Symbol(range_op)),
+                Some(Sexpr::Symbol(intvl_op)),
                 Some(Sexpr::List(left_values)),
                 Some(Sexpr::List(right_values)),
             ) => {
-                todo!();
+                // (ixscan idx_name interval (137 "foo") (731 "bar"))
+                let mut left_subspace = collection.index_subspace(idx_name);
+                let mut right_subspace = collection.index_subspace(idx_name);
+                if index.fields.len() != left_values.len()
+                    || index.fields.len() != right_values.len()
+                {
+                    return error::BadRequest {
+                        e: format!(
+                            "invalid number of fields in range expression, index {idx_name} has {} fields",
+                            index.fields.len(),
+                        ),
+                    }
+                    .fail();
+                }
+                for value in left_values {
+                    left_subspace = left_subspace.subspace(&Value::from_sexpr(value)?);
+                }
+                for value in right_values {
+                    right_subspace = right_subspace.subspace(&Value::from_sexpr(value)?);
+                }
+                let (left, _) = left_subspace.range();
+                let (_, right) = right_subspace.range();
+                let range = match *intvl_op {
+                    "interval" => RangeOption {
+                        begin: KeySelector::first_greater_or_equal(left),
+                        end: KeySelector::last_less_or_equal(right),
+                        ..Default::default()
+                    },
+                    "right_interval" => RangeOption {
+                        begin: KeySelector::first_greater_or_equal(left),
+                        end: KeySelector::last_less_than(right),
+                        ..Default::default()
+                    },
+                    "left_interval" => RangeOption {
+                        begin: KeySelector::first_greater_than(left),
+                        end: KeySelector::last_less_or_equal(right),
+                        ..Default::default()
+                    },
+                    v => {
+                        return error::BadRequest {
+                            e: format!("invalid range expression {v}"),
+                        }
+                        .fail();
+                    }
+                };
+                return Ok(Self { collection, range });
             }
             _ => {
                 return error::BadRequest {
@@ -165,63 +207,6 @@ impl<'a> IdxScan<'a> {
                 .fail();
             }
         };
-        /*
-        let mut predicates = Vec::with_capacity(exprs.len());
-        for expr in exprs {
-            let expr = Expression::try_from(expr)?;
-            let Expression::Atomic(predicate) = expr else {
-                return error::BadRequest {
-                    e: "ixscan expression shall be predicate using indexed field",
-                }
-                .fail();
-            };
-            predicates.push(predicate);
-        }
-        let predicate_fields: Vec<&str> = predicates.iter().map(|p| p.fld.as_str()).collect();
-
-        'NEXT_INDEX: for (idx_name, def) in schema.indexes.iter() {
-            if !def.ready || predicate_fields.len() > def.fields.len() {
-                continue;
-            }
-            for f in predicate_fields.iter() {
-                if !def.fields.iter().any(|(field, _)| field.as_str() == *f) {
-                    continue 'NEXT_INDEX;
-                }
-            }
-            // all predicate fields are found in index, we can use it
-            let mut idx_space = collection.index_subspace(&idx_name);
-            for (field, prefix) in def.fields.iter() {
-                let predicate = predicates.iter().find(|p| &p.fld == field).unwrap();
-                let val = match prefix {
-                    Some(prefix) => {
-                        let mut v = predicate.val.clone();
-                        v.truncate(*prefix)?;
-                        v
-                    }
-                    None => predicate.val.clone(),
-                };
-                match predicate.rel {
-                    crate::expression::Relation::Eq => {
-                        idx_space = idx_space.subspace(&val);
-                    }
-                    crate::expression::Relation::Gt => {
-                        idx_space =
-                    }
-                    crate::expression::Relation::Ge => todo!("relation unsupported"),
-                    crate::expression::Relation::Lt => todo!("relation unsupported"),
-                    crate::expression::Relation::Le => todo!("relation unsupported"),
-                }
-            }
-            return Ok(Self {
-                collection,
-                idx_space,
-            });
-        }
-
-        return error::BadRequest {
-            e: "idxscan refers to non-indexed fields, or index is not yet ready to use",
-        }
-        .fail(); */
     }
 
     fn execute(&self, tx: &'a Transaction) -> impl Stream<Item = Result<Document, AppError>> {
@@ -232,10 +217,19 @@ impl<'a> IdxScan<'a> {
                 source: e,
             })
             .try_filter_map(async |value| {
-                let (schema_version, versionstamp) = self
-                    .idx_subspace
-                    .unpack::<(SchemaVersion, Versionstamp)>(value.key())
-                    .context(error::FdbTupleUnpack)?;
+                let elems: Vec<tuple::Element> =
+                    tuple::unpack(value.key()).context(error::FdbTupleUnpack)?;
+                if elems.len() < 7 {
+                    whatever!("unexpected index key length: {}", elems.len());
+                }
+                // last two elements of tuple are schema version and versionstamp that define document ID
+                let (schema_version, versionstamp) =
+                    match (&elems[elems.len() - 2], &elems[elems.len() - 1]) {
+                        (tuple::Element::Int(n), tuple::Element::Versionstamp(vs)) => {
+                            (*n as u32, vs.clone())
+                        }
+                        _ => whatever!("unexpected index key format"),
+                    };
                 let doc_id = DocID::new(schema_version, versionstamp);
                 let Some(doc) = DB::get_doc_tx(self.collection, &doc_id, tx).await? else {
                     whatever!("missing indexed document {doc_id}");
@@ -288,7 +282,7 @@ impl<'a> Plan<'a> {
         match list.get(0) {
             Some(Sexpr::Symbol(op)) => match *op {
                 "ixscan" => {
-                    assert_longer(&list, 4)?;
+                    assert_longer(&list, 3)?;
                     Ok(Self::IdxScan(IdxScan::from_exprs(
                         &list[1..],
                         collection,
@@ -346,6 +340,32 @@ impl<'a> Plan<'a> {
                 .boxed(),
             Plan::Fullscan(fullscan) => fullscan.execute(tx).boxed(),
             Plan::IdxScan(idx_scan) => idx_scan.execute(tx).boxed(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::schema::Collection;
+
+    #[test]
+    fn test_unpack() {
+        let coll = Collection {
+            db: Box::from("testdb"),
+            collection: Box::from("testcol"),
+        };
+
+        let subspace = coll
+            .index_subspace("testindex")
+            .subspace(&1u32)
+            .subspace(&2u32)
+            .subspace(&3u32)
+            .subspace(&4u32);
+        let key = subspace.pack(&"foo");
+        let tp: Vec<foundationdb::tuple::Element> = subspace.unpack(&key).unwrap();
+        match tp.last().unwrap() {
+            foundationdb::tuple::Element::String(cow) => assert_eq!(cow, "fo11o"),
+            _ => panic!("aaa"),
         }
     }
 }

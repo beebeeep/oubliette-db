@@ -8,6 +8,8 @@ services:
         target: /var/fdb/
     ports:
       - 4500:4500
+    post_start:
+      - command: ["fdbcli", "--exec", "configure new single ssd-redwood-1"]
 
 volumes:
   dbdata:

@@ -158,38 +158,6 @@ impl DB {
                 };
                 // TODO: truncate string value to prefix_len
                 idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
-                // match value.as_ref() {
-                //     rmpv::Value::Boolean(b) => {
-                //         idx_subspace = idx_subspace.subspace(b);
-                //     }
-                //     rmpv::Value::F32(f) => {
-                //         idx_subspace = idx_subspace.subspace(f);
-                //     }
-                //     rmpv::Value::F64(f) => {
-                //         idx_subspace = idx_subspace.subspace(f);
-                //     }
-                //     rmpv::Value::Integer(n) => {
-                //         if let Some(n) = n.as_u64() {
-                //             idx_subspace = idx_subspace.subspace(&n);
-                //         }
-                //         if let Some(n) = n.as_i64() {
-                //             idx_subspace = idx_subspace.subspace(&n);
-                //         }
-                //     }
-                //     rmpv::Value::String(s) => {
-                //         if let Some(mut s) = s.as_str() {
-                //             if let Some(prefix_len) = prefix_len {
-                //                 s = &s[..s.floor_char_boundary(*prefix_len)]
-                //             }
-                //             idx_subspace = idx_subspace.subspace(&s);
-                //         } else {
-                //             continue 'NEXT_INDEX;
-                //         }
-                //     }
-                //     _ => {
-                //         continue 'NEXT_INDEX;
-                //     }
-                // };
             }
             let key = idx_subspace
                 .pack_with_versionstamp(&(schema_version, &Versionstamp::incomplete(0)));
