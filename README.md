@@ -54,7 +54,7 @@ Examples:
   (and
     (in .foo 42 137)     ; .foo is either 42 or 137 
     (eq .bar "chlos")    ; and .bar equals string "chlos"
-    (gt .baz.baq 0)))`   ; and nested field with path .baz.baq is greater than zero
+    (gt .baz.baq 0)))   ; and nested field with path .baz.baq is greater than zero
 ``` 
 
 ### Index scans
@@ -69,7 +69,7 @@ Examples:
 ```
 
 ### Filtering and combining
-`scan` and `ixscan` operators are the only "producing" operators, i.e. those who can inject documents into pipeline by reading the from the DB. However, you can combine and filter them to create more complicated queries.
+`scan` and `ixscan` operators are the only "producing" operators, i.e. those who can inject documents into pipeline by reading from the DB. However, you can combine and filter them to create more complicated queries.
 
 `(union <subplan1> <subplan2> ... <subplanN>)` simply joins the documents returned by `<subplan1>` - `<subplanN>`, iterating over each sub-plan sequentially.
 
