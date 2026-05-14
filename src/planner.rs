@@ -76,12 +76,18 @@ impl<'a> Fullscan<'a> {
 }
 
 impl<'a> IdxScan<'a> {
-    fn from_exprs(
-        exprs: &[Sexpr],
+    fn from_expr(
+        expr: &Sexpr,
         collection: &'a Collection,
         schema: &CollectionSchema,
     ) -> Result<Self, AppError> {
-        let Sexpr::Symbol(idx_name) = exprs[0] else {
+        let Sexpr::List(exprs) = expr else {
+            return error::BadRequest {
+                e: "ixscan argument must be a list",
+            }
+            .fail()?;
+        };
+        let Sexpr::Symbol(idx_name) = exprs[1] else {
             return error::BadRequest {
                 e: "invalid ixscan expression, index name is expected",
             }
@@ -97,9 +103,9 @@ impl<'a> IdxScan<'a> {
             .fail();
         }
 
-        match (exprs.get(1), exprs.get(2), exprs.get(3)) {
+        match (exprs.get(0), exprs.get(2), exprs.get(3)) {
             (Some(Sexpr::Symbol(op)), Some(Sexpr::List(op_values)), None) => {
-                // (ixscan idx_name eq (137 "foo"))
+                // (ixscan (eq idx_name (137 "foo")))
                 let (idx_space_begin, idx_space_end) = collection.index_subspace(idx_name).range();
                 let mut idx_subspace = collection.index_subspace(idx_name);
                 if index.fields.len() != op_values.len() {
@@ -120,23 +126,23 @@ impl<'a> IdxScan<'a> {
                 let range = match *op {
                     "eq" => RangeOption::from(&idx_subspace),
                     "ge" => RangeOption {
-                        begin: KeySelector::first_greater_or_equal(last),
-                        end: KeySelector::last_less_than(idx_space_end),
+                        begin: KeySelector::first_greater_or_equal(first),
+                        end: KeySelector::first_greater_than(idx_space_end),
                         ..Default::default()
                     },
                     "gt" => RangeOption {
                         begin: KeySelector::first_greater_than(last),
-                        end: KeySelector::last_less_than(idx_space_end),
+                        end: KeySelector::first_greater_than(idx_space_end),
                         ..Default::default()
                     },
                     "le" => RangeOption {
-                        begin: KeySelector::first_greater_than(idx_space_begin),
-                        end: KeySelector::last_less_or_equal(first),
+                        begin: KeySelector::first_greater_or_equal(idx_space_begin),
+                        end: KeySelector::first_greater_than(last),
                         ..Default::default()
                     },
                     "lt" => RangeOption {
                         begin: KeySelector::first_greater_than(idx_space_begin),
-                        end: KeySelector::last_less_than(first),
+                        end: KeySelector::last_less_than(last),
                         ..Default::default()
                     },
                     v => {
@@ -153,7 +159,7 @@ impl<'a> IdxScan<'a> {
                 Some(Sexpr::List(left_values)),
                 Some(Sexpr::List(right_values)),
             ) => {
-                // (ixscan idx_name interval (137 "foo") (731 "bar"))
+                // (ixscan (interval idx_name (137 "foo") (731 "bar")))
                 let mut left_subspace = collection.index_subspace(idx_name);
                 let mut right_subspace = collection.index_subspace(idx_name);
                 if index.fields.len() != left_values.len()
@@ -173,22 +179,27 @@ impl<'a> IdxScan<'a> {
                 for value in right_values {
                     right_subspace = right_subspace.subspace(&Value::from_sexpr(value)?);
                 }
-                let (left, _) = left_subspace.range();
-                let (_, right) = right_subspace.range();
+                let (left_first, left_last) = left_subspace.range();
+                let (right_first, right_last) = right_subspace.range();
                 let range = match *intvl_op {
                     "interval" => RangeOption {
-                        begin: KeySelector::first_greater_or_equal(left),
-                        end: KeySelector::last_less_or_equal(right),
+                        begin: KeySelector::first_greater_or_equal(left_first),
+                        end: KeySelector::first_greater_than(right_last),
                         ..Default::default()
                     },
                     "right_interval" => RangeOption {
-                        begin: KeySelector::first_greater_or_equal(left),
-                        end: KeySelector::last_less_than(right),
+                        begin: KeySelector::first_greater_or_equal(left_first),
+                        end: KeySelector::last_less_than(right_last),
                         ..Default::default()
                     },
                     "left_interval" => RangeOption {
-                        begin: KeySelector::first_greater_than(left),
-                        end: KeySelector::last_less_or_equal(right),
+                        begin: KeySelector::first_greater_than(left_last),
+                        end: KeySelector::first_greater_than(right_last),
+                        ..Default::default()
+                    },
+                    "open_interval" => RangeOption {
+                        begin: KeySelector::first_greater_than(left_last),
+                        end: KeySelector::last_less_than(right_last),
                         ..Default::default()
                     },
                     v => {
@@ -282,11 +293,9 @@ impl<'a> Plan<'a> {
         match list.get(0) {
             Some(Sexpr::Symbol(op)) => match *op {
                 "ixscan" => {
-                    assert_longer(&list, 3)?;
-                    Ok(Self::IdxScan(IdxScan::from_exprs(
-                        &list[1..],
-                        collection,
-                        schema,
+                    assert_len(&list, 2)?;
+                    Ok(Self::IdxScan(IdxScan::from_expr(
+                        &list[1], collection, schema,
                     )?))
                 }
                 "scan" => {
