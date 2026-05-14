@@ -14,7 +14,7 @@ use axum::{
     routing::{get, patch, post, put},
 };
 use serde::{Deserialize, Serialize};
-use snafu::ResultExt;
+use snafu::{ResultExt, whatever};
 
 #[derive(Serialize, Deserialize)]
 pub struct QueryRequest {
@@ -121,10 +121,18 @@ async fn collection_get_doc(
     State(state): State<Arc<AppState>>,
     Path((db, collection, doc_id)): Path<(String, String, String)>,
 ) -> Result<Json<GetDocResponse>, AppError> {
-    let doc = state.db.get_doc(&db, &collection, doc_id.as_str()).await?;
-    Ok(Json(GetDocResponse {
-        doc: doc.map(mp2json),
-    }))
+    match state.db.get_doc(&db, &collection, doc_id.as_str()).await? {
+        None => Ok(Json(GetDocResponse { doc: None })),
+        Some(v) => {
+            let rmpv::Value::Map(mut items) = v else {
+                whatever!("invalid document in storage");
+            };
+            items.push((rmpv::Value::from("__id"), rmpv::Value::from(doc_id)));
+            Ok(Json(GetDocResponse {
+                doc: Some(mp2json(rmpv::Value::Map(items))),
+            }))
+        }
+    }
 }
 
 async fn collection_query(

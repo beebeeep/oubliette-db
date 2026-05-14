@@ -24,6 +24,10 @@ Experimental document [layer](https://apple.github.io/foundationdb/layer-concept
   ```
   curl -vks -X POST --json '{"name": "idx_foo", "fields": [{"field": ".foo"}]}' localhost:4800/_manage/testdb/testcollection/create_index
   ```
+* Retrieve document by ID:
+  ```
+  curl -s localhost:4800/testdb/testcollection/04000000000000004e12ca2000000000
+  ```
 * Query the data:
   ```
   curl -vs -X POST --json '{"plan": "(scan ())"}' localhost:4800/testdb/testcollection
