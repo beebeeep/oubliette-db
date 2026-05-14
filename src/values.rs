@@ -1,10 +1,10 @@
-use std::cmp::Ordering;
+use std::{cmp::Ordering, ops::Index};
 
 use base64::prelude::*;
 use bytemuck::TransparentWrapper;
-use snafu::OptionExt;
+use snafu::{OptionExt, ResultExt};
 
-use crate::error::AppError;
+use crate::error::{self, AppError};
 
 /// Value wraps rmpv::Value providing a bit more flexible comparison operations (can compare ints with floats and different floats with each other)
 #[repr(transparent)]
@@ -15,6 +15,56 @@ impl Value {
     pub(crate) fn from_ref(v: &rmpv::Value) -> &Self {
         TransparentWrapper::wrap_ref(v)
     }
+
+    pub(crate) fn from_sexpr(e: &sexpression::Expression<'_>) -> Result<Self, AppError> {
+        Ok(match e {
+            sexpression::Expression::Number(f) => {
+                if f.fract() == 0.0 {
+                    Self::from(*f as i64)
+                } else {
+                    Self::from(*f)
+                }
+            }
+            sexpression::Expression::Bool(b) => Self::from(*b),
+            sexpression::Expression::Str(s) => Self::from(*s),
+            sexpression::Expression::Symbol(s) if s.len() >= 4 => {
+                // rust-like suffixes like 137u32 or 3.14f32
+                match (&s[..s.len() - 3], &s[s.len() - 3..]) {
+                    (v, "u32") => {
+                        Self::from(v.parse::<u32>().whatever_context("invalid u32 value")?)
+                    }
+                    (v, "u64") => {
+                        Self::from(v.parse::<u64>().whatever_context("invalid u64 value")?)
+                    }
+                    (v, "i32") => {
+                        Self::from(v.parse::<i32>().whatever_context("invalid i32 value")?)
+                    }
+                    (v, "i64") => {
+                        Self::from(v.parse::<i64>().whatever_context("invalid i64 value")?)
+                    }
+                    (v, "f32") => {
+                        Self::from(v.parse::<f32>().whatever_context("invalid f32 value")?)
+                    }
+                    (v, "f64") => {
+                        Self::from(v.parse::<f32>().whatever_context("invalid f64 value")?)
+                    }
+                    _ => {
+                        return error::BadRequest {
+                            e: format!("cannot parse value"),
+                        }
+                        .fail();
+                    }
+                }
+            }
+            _ => {
+                return error::BadRequest {
+                    e: "invalid value expression",
+                }
+                .fail();
+            }
+        })
+    }
+
     pub(crate) fn truncate(&mut self, len: usize) -> Result<(), AppError> {
         if let rmpv::Value::String(us) = &self.0 {
             let mut s = us.as_str().whatever_context("non UTF-8 string")?;
