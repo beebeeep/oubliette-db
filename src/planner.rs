@@ -38,10 +38,6 @@ pub(crate) struct Filter<'a> {
 pub(crate) struct IdxScan<'a> {
     collection: &'a Collection,
     range: RangeOption<'a>,
-    // TODO: add extra filter here to support range scans over composite indexes:
-    // Suppose (foo, bar) is index, and query is (and (gt .foo 300) (le .bar 200))
-    // Scan takes continious subrange where .foo > 300 and can select only those index entries
-    // where .bar <= 200, *before* fetching the documents from FDB
 }
 
 pub(crate) struct Fullscan<'a> {

@@ -1,3 +1,5 @@
 /target
 dbvolume
 testdata
+perf.data*
+flamegraph.svg
