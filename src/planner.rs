@@ -187,17 +187,17 @@ impl<'a> IdxScan<'a> {
                         end: KeySelector::first_greater_than(right_last),
                         ..Default::default()
                     },
-                    "right_interval" => RangeOption {
+                    "right-interval" => RangeOption {
                         begin: KeySelector::first_greater_or_equal(left_first),
                         end: KeySelector::last_less_than(right_last),
                         ..Default::default()
                     },
-                    "left_interval" => RangeOption {
+                    "left-interval" => RangeOption {
                         begin: KeySelector::first_greater_than(left_last),
                         end: KeySelector::first_greater_than(right_last),
                         ..Default::default()
                     },
-                    "open_interval" => RangeOption {
+                    "open-interval" => RangeOption {
                         begin: KeySelector::first_greater_than(left_last),
                         end: KeySelector::last_less_than(right_last),
                         ..Default::default()
