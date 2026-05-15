@@ -1,18 +1,17 @@
 use foundationdb::{
     KeySelector, RangeOption, Transaction,
-    tuple::{self, Subspace, Versionstamp},
+    tuple::{self},
 };
 use futures::{Stream, StreamExt, TryStreamExt, stream};
 use sexpression::Expression as Sexpr;
 use snafu::{OptionExt, ResultExt, whatever};
-use tracing::debug;
 
 use crate::{
     document::{DocID, Document},
     error::{self, AppError},
     expression::Expression,
     misc::{assert_len, assert_longer},
-    schema::{Collection, CollectionSchema, SchemaVersion},
+    schema::{Collection, CollectionSchema},
     storage::DB,
     values::Value,
 };
@@ -176,7 +175,7 @@ impl<'a> IdxScan<'a> {
                     right_subspace = right_subspace.subspace(&Value::from_sexpr(value)?);
                 }
                 let (left_first, left_last) = left_subspace.range();
-                let (right_first, right_last) = right_subspace.range();
+                let (_, right_last) = right_subspace.range();
                 let range = match *intvl_op {
                     "interval" => RangeOption {
                         begin: KeySelector::first_greater_or_equal(left_first),

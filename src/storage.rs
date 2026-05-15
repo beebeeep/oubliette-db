@@ -5,10 +5,10 @@ use crate::{
     error::{self, AppError, MPVDecode},
     planner::Plan,
     schema::{
-        Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_INDEX, KEY_PK,
-        SPACE_DATA, SchemaUpdate, SchemaVersion,
+        Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_PK, SPACE_DATA,
+        SchemaUpdate, SchemaVersion,
     },
-    values::{self, Value},
+    values::Value,
     worker,
 };
 use foundationdb::{
@@ -152,7 +152,7 @@ impl DB {
         'NEXT_INDEX: for index in affected_indexes {
             let mut idx_subspace = collection.index_subspace(&index);
             let index_def = indexes.get(&index).expect("index should exist");
-            for (field, prefix_len) in &index_def.fields {
+            for (field, _prefix_len) in &index_def.fields {
                 let Some(value) = Value::extract_field(&field, doc) else {
                     continue 'NEXT_INDEX;
                 };

@@ -2,7 +2,7 @@ use std::{collections::HashMap, fmt::Display, sync::LazyLock};
 
 use foundationdb::tuple::Subspace;
 use serde::{Deserialize, Serialize};
-use snafu::{OptionExt, ResultExt, whatever};
+use snafu::{OptionExt, ResultExt};
 use tracing::info;
 
 use crate::{
@@ -134,9 +134,6 @@ impl From<(&str, &str)> for Collection {
 }
 
 impl Collection {
-    pub(crate) fn subspace(&self) -> foundationdb::tuple::Subspace {
-        Subspace::all().subspace(&(SPACE_DATA, self.db.as_ref(), self.collection.as_ref()))
-    }
     pub(crate) fn pk_subspace(&self) -> foundationdb::tuple::Subspace {
         Subspace::all().subspace(&(
             SPACE_DATA,
@@ -170,24 +167,6 @@ impl InstanceSchema {
             None => Self::default(),
         };
         Ok(schema)
-    }
-
-    pub(crate) fn update_index<F>(
-        &mut self,
-        collection: &Collection,
-        index_name: &str,
-        update: F,
-    ) -> Result<(), AppError>
-    where
-        F: FnOnce(&mut IndexDef) -> Result<(), AppError>,
-    {
-        let Some(collection_schema) = self.collections.get_mut(collection) else {
-            whatever!("cannot find schema of collection {collection}")
-        };
-        let Some(index_def) = collection_schema.indexes.get_mut(index_name) else {
-            whatever!("cannot find index {index_name} in {collection}");
-        };
-        update(index_def)
     }
 
     pub(crate) async fn apply_schema_update(
