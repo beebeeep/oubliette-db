@@ -1,7 +1,7 @@
 use std::{
     env::args,
     fs::File,
-    io::{self, Write},
+    io::{self, BufReader, Write},
     time,
 };
 
@@ -13,9 +13,9 @@ use snafu::{ResultExt, Whatever};
 #[tokio::main]
 async fn main() -> Result<(), Whatever> {
     let fname = args().skip(1).next().unwrap();
-    let f = File::open(fname).whatever_context("opening file")?;
-    let mut docs = serde_json::Deserializer::from_reader(f).into_iter::<Value>();
-    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    let f = BufReader::new(File::open(fname).whatever_context("opening file")?);
+    let jdocs = serde_json::Deserializer::from_reader(f).into_iter::<Value>();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(32);
     let mut done = false;
 
     for _ in 0..32 {
@@ -26,31 +26,33 @@ async fn main() -> Result<(), Whatever> {
             }
         });
     }
-    let mut count = 0usize;
     let start = time::Instant::now();
+    let mut docs = jdocs.into_iter();
+    let mut count = 0usize;
     loop {
         if done {
             break;
         }
         let mut buf = Vec::with_capacity(400);
-        for _ in 0..200 {
+        for _ in 0..buf.capacity() {
             if let Some(d) = docs.next() {
-                count += 1;
                 buf.push(d.whatever_context("unmarshalling doc")?);
             } else {
                 done = true;
                 break;
             }
         }
+        let batch_tx = rx.recv().await.unwrap();
+        count += buf.len();
+        if let Err(_) = batch_tx.send(buf) {
+            eprintln!("failed to send")
+        }
+
         print!(
             "loaded {count} docs at {:.1} rps\r",
             count as f64 / start.elapsed().as_secs_f64()
         );
         io::stdout().flush().unwrap();
-        let batch_tx = rx.recv().await.unwrap();
-        if let Err(_) = batch_tx.send(buf) {
-            eprintln!("failed to send")
-        }
     }
     Ok(())
 }
