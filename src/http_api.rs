@@ -29,9 +29,16 @@ pub struct QueryResponse {
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct UpdateRequest {}
+pub struct UpdateRequest {
+    pub query: Option<Box<str>>,
+    pub plan: Option<Box<str>>,
+    pub update: Box<str>,
+}
+
 #[derive(Serialize, Deserialize)]
-pub struct UpdateResponse {}
+pub struct UpdateResponse {
+    pub documents_updated: usize,
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct SetRequest {
@@ -213,5 +220,15 @@ async fn collection_update(
     Path(collection): Path<String>,
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<UpdateResponse>, AppError> {
-    todo!();
+    let documents_updated = state
+        .db
+        .update(
+            &db,
+            &collection,
+            req.query.as_deref(),
+            req.plan.as_deref(),
+            &req.update,
+        )
+        .await?;
+    Ok(Json(UpdateResponse { documents_updated }))
 }

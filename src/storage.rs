@@ -208,6 +208,17 @@ impl DB {
         Ok(query_result)
     }
 
+    pub(crate) async fn update(
+        &self,
+        db: &str,
+        collection: &str,
+        query: Option<&str>,
+        plan: Option<&str>,
+        update: &str,
+    ) -> Result<usize, AppError> {
+        todo!()
+    }
+
     /// queries single doc by id
     pub(crate) async fn get_doc(
         &self,

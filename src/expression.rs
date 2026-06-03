@@ -7,12 +7,20 @@ use crate::{
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
 
+pub(crate) struct Update(Vec<AtomicUpdate>);
+enum AtomicUpdate {
+    Set(Value),
+    Add(Value),
+    Delete,
+    //Push(Value), TODO: once we add support of arrays
+}
+
 #[derive(Clone, PartialEq, Debug)]
-pub(crate) enum Expression {
-    And(Vec<Expression>),
-    Or(Vec<Expression>),
-    Not(Box<Expression>),
-    Atomic(Predicate),
+pub(crate) enum Predicate {
+    And(Vec<Predicate>),
+    Or(Vec<Predicate>),
+    Not(Box<Predicate>),
+    Atomic(AtomicPredicate),
     Empty,
 }
 
@@ -26,13 +34,13 @@ pub(crate) enum Relation {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub(crate) struct Predicate {
+pub(crate) struct AtomicPredicate {
     pub(crate) fld: String,
     pub(crate) rel: Relation,
     pub(crate) val: Value,
 }
 
-impl Predicate {
+impl AtomicPredicate {
     fn evaluate(&self, doc: &Document) -> bool {
         let Some(lhs) = Value::extract_field(&self.fld, &doc.value) else {
             return false;
@@ -49,14 +57,14 @@ impl Predicate {
     }
 }
 
-impl Expression {
+impl Predicate {
     pub(crate) fn evaluate(&self, doc: &Document) -> bool {
         match self {
-            Expression::And(expressions) => expressions.iter().all(|e| e.evaluate(doc)),
-            Expression::Or(expressions) => expressions.iter().any(|e| e.evaluate(doc)),
-            Expression::Not(expression) => !expression.evaluate(doc),
-            Expression::Atomic(predicate) => predicate.evaluate(doc),
-            Expression::Empty => true,
+            Predicate::And(expressions) => expressions.iter().all(|e| e.evaluate(doc)),
+            Predicate::Or(expressions) => expressions.iter().any(|e| e.evaluate(doc)),
+            Predicate::Not(expression) => !expression.evaluate(doc),
+            Predicate::Atomic(predicate) => predicate.evaluate(doc),
+            Predicate::Empty => true,
         }
     }
 
@@ -105,7 +113,7 @@ impl Expression {
     }
 }
 
-impl TryFrom<&str> for Expression {
+impl TryFrom<&str> for Predicate {
     type Error = AppError;
 
     fn try_from(query: &str) -> Result<Self, Self::Error> {
@@ -122,7 +130,7 @@ impl TryFrom<&str> for Expression {
     }
 }
 
-impl TryFrom<&sexpression::Expression<'_>> for Expression {
+impl TryFrom<&sexpression::Expression<'_>> for Predicate {
     type Error = AppError;
     fn try_from(sexpr: &sexpression::Expression) -> Result<Self, Self::Error> {
         let Sexpr::List(list) = sexpr else {
@@ -157,7 +165,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate {
+                    Ok(Self::Atomic(AtomicPredicate {
                         fld,
                         rel: Relation::Eq,
                         val: arg,
@@ -167,7 +175,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate {
+                    Ok(Self::Atomic(AtomicPredicate {
                         fld,
                         rel: Relation::Gt,
                         val: arg,
@@ -177,7 +185,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate {
+                    Ok(Self::Atomic(AtomicPredicate {
                         fld: fld.clone(),
                         rel: Relation::Ge,
                         val: arg,
@@ -187,7 +195,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate {
+                    Ok(Self::Atomic(AtomicPredicate {
                         fld,
                         rel: Relation::Lt,
                         val: arg,
@@ -197,7 +205,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     assert_len(&list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
-                    Ok(Self::Atomic(Predicate {
+                    Ok(Self::Atomic(AtomicPredicate {
                         fld,
                         rel: Relation::Le,
                         val: arg,
@@ -214,7 +222,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
                     Ok(Self::Or(
                         arg.into_iter()
                             .map(|v| {
-                                Self::Atomic(Predicate {
+                                Self::Atomic(AtomicPredicate {
                                     fld: fld.clone(),
                                     rel: Relation::Eq,
                                     val: v,
@@ -236,6 +244,34 @@ impl TryFrom<&sexpression::Expression<'_>> for Expression {
         }
     }
 }
+impl TryFrom<&str> for Update {
+    type Error = AppError;
+
+    fn try_from(query: &str) -> Result<Self, Self::Error> {
+        let (expr, _) = sexpression::read(query).context(error::QueryParse {
+            e: "failed to parse update query",
+        })?;
+        let Sexpr::List(updates) = expr else {
+            error::BadRequest {
+                e: "update query must be list of update expressions",
+            }
+            .fail()?
+        };
+
+        let mut r: Vec<AtomicUpdate> = Vec::with_capacity(updates.len());
+        for e in &updates {
+            r.push(e.try_into()?);
+        }
+        Ok(Self(r))
+    }
+}
+
+impl TryFrom<&sexpression::Expression<'_>> for AtomicUpdate {
+    type Error = AppError;
+    fn try_from(sexpr: &sexpression::Expression) -> Result<Self, Self::Error> {
+        todo!()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -243,32 +279,32 @@ mod tests {
 
     use crate::{
         document::{DocID, Document},
-        expression::{Expression, Predicate, Relation},
+        expression::{AtomicPredicate, Predicate, Relation},
         values::{Value, json2mp},
     };
 
     #[test]
     fn parsing() {
-        let p = Expression::try_from("(eq .foo 137)").unwrap();
+        let p = Predicate::try_from("(eq .foo 137)").unwrap();
         assert_eq!(
             p,
-            Expression::Atomic(Predicate {
+            Predicate::Atomic(AtomicPredicate {
                 fld: String::from(".foo"),
                 rel: Relation::Eq,
                 val: Value::from(137),
             })
         );
 
-        let p = Expression::try_from(r#"(and (lt .foo 137) (eq .bar "chlos"))"#).unwrap();
+        let p = Predicate::try_from(r#"(and (lt .foo 137) (eq .bar "chlos"))"#).unwrap();
         assert_eq!(
             p,
-            Expression::And(vec![
-                Expression::Atomic(Predicate {
+            Predicate::And(vec![
+                Predicate::Atomic(AtomicPredicate {
                     fld: String::from(".foo"),
                     rel: Relation::Lt,
                     val: Value::from(137),
                 }),
-                Expression::Atomic(Predicate {
+                Predicate::Atomic(AtomicPredicate {
                     fld: String::from(".bar"),
                     rel: Relation::Eq,
                     val: Value::from("chlos"),
@@ -279,7 +315,7 @@ mod tests {
 
     #[test]
     fn evaluation() {
-        let p = Expression::try_from("(eq .foo 137)").unwrap();
+        let p = Predicate::try_from("(eq .foo 137)").unwrap();
         let mut doc = Document {
             id: DocID::default(),
             value: json2mp(json!({})),
@@ -289,13 +325,13 @@ mod tests {
         doc.value = json2mp(json!({"foo": 137, "bar": "chlos", "baz": {"baq": 300}}));
         assert!(p.evaluate(&doc));
 
-        let p = Expression::try_from("(gt .foo 0)").unwrap();
+        let p = Predicate::try_from("(gt .foo 0)").unwrap();
         assert!(p.evaluate(&doc));
 
-        let p = Expression::try_from("(eq .bar \"chlos\")").unwrap();
+        let p = Predicate::try_from("(eq .bar \"chlos\")").unwrap();
         assert!(p.evaluate(&doc));
 
-        let p = Expression::try_from("(eq .baz.baq 300)").unwrap();
+        let p = Predicate::try_from("(eq .baz.baq 300)").unwrap();
         assert!(p.evaluate(&doc));
     }
 }

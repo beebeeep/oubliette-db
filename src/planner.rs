@@ -9,7 +9,7 @@ use snafu::{OptionExt, ResultExt, whatever};
 use crate::{
     document::{DocID, Document},
     error::{self, AppError},
-    expression::Expression,
+    expression::Predicate,
     misc::{assert_len, assert_longer},
     schema::{Collection, CollectionSchema},
     storage::DB,
@@ -31,7 +31,7 @@ pub(crate) enum Plan<'a> {
 
 pub(crate) struct Filter<'a> {
     driver: Box<Plan<'a>>,
-    expr: Expression,
+    expr: Predicate,
 }
 
 pub(crate) struct IdxScan<'a> {
@@ -41,14 +41,14 @@ pub(crate) struct IdxScan<'a> {
 
 pub(crate) struct Fullscan<'a> {
     collection: &'a Collection,
-    filter: Expression,
+    filter: Predicate,
 }
 
 impl<'a> Fullscan<'a> {
     fn from_expr(expr: &Sexpr, collection: &'a Collection) -> Result<Self, AppError> {
         Ok(Self {
             collection,
-            filter: Expression::try_from(expr)?,
+            filter: Predicate::try_from(expr)?,
         })
     }
 
@@ -301,7 +301,7 @@ impl<'a> Plan<'a> {
                     assert_len(&list, 3)?;
                     Ok(Self::Filter(Filter {
                         driver: Box::new(Self::from_expr(&list[1], collection, schema)?),
-                        expr: Expression::try_from(&list[2])?,
+                        expr: Predicate::try_from(&list[2])?,
                     }))
                 }
                 "union" => {
