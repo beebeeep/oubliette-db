@@ -9,9 +9,9 @@ use snafu::ResultExt;
 
 pub(crate) struct Update(Vec<AtomicUpdate>);
 enum AtomicUpdate {
-    Set(Value),
-    Add(Value),
-    Delete,
+    Set(Box<str>, Value),
+    Add(Box<str>, Value),
+    Delete(Box<str>),
     //Push(Value), TODO: once we add support of arrays
 }
 
@@ -269,7 +269,70 @@ impl TryFrom<&str> for Update {
 impl TryFrom<&sexpression::Expression<'_>> for AtomicUpdate {
     type Error = AppError;
     fn try_from(sexpr: &sexpression::Expression) -> Result<Self, Self::Error> {
-        todo!()
+        let Sexpr::List(args) = sexpr else {
+            error::BadRequest {
+                e: "update expression must be a list",
+            }
+            .fail()?
+        };
+        assert_longer(args, 2)?;
+        match &args[0] {
+            Sexpr::Symbol("add") => {
+                assert_len(args, 3)?;
+                let Sexpr::Symbol(fld) = args[1] else {
+                    error::BadRequest {
+                        e: "field reference expected in 'add' update expression",
+                    }
+                    .fail()?
+                };
+                let v = Value::from_sexpr(&args[2])?;
+                Ok(Self::Add(fld.into(), v))
+            }
+            Sexpr::Symbol("set") => {
+                assert_len(args, 3)?;
+                let Sexpr::Symbol(fld) = args[1] else {
+                    error::BadRequest {
+                        e: "field reference expected in 'set' update expression",
+                    }
+                    .fail()?
+                };
+                let v = Value::from_sexpr(&args[2])?;
+                Ok(Self::Set(fld.into(), v))
+            }
+            Sexpr::Symbol("delete") => {
+                assert_len(args, 2)?;
+                let Sexpr::Symbol(fld) = args[1] else {
+                    error::BadRequest {
+                        e: "field reference expected in 'set' update expression",
+                    }
+                    .fail()?
+                };
+                Ok(Self::Delete(fld.into()))
+            }
+            v => error::BadRequest {
+                e: format!("update expression syntax error: unexpected token {v:?}"),
+            }
+            .fail()?,
+        }
+    }
+}
+
+impl Update {
+    pub(crate) fn apply(&self, doc: &mut Document) -> Result<(), AppError> {
+        for u in &self.0 {
+            u.apply(doc)?;
+        }
+        Ok(())
+    }
+}
+
+impl AtomicUpdate {
+    fn apply(&self, doc: &mut Document) -> Result<(), AppError> {
+        match self {
+            AtomicUpdate::Set(fld, value) => todo!(),
+            AtomicUpdate::Add(fld, value) => todo!(),
+            AtomicUpdate::Delete(fld) => todo!(),
+        }
     }
 }
 

@@ -216,7 +216,33 @@ impl DB {
         plan: Option<&str>,
         update: &str,
     ) -> Result<usize, AppError> {
-        todo!()
+        let collection = Collection::from((db, collection));
+        let schema = self.schema.read().await;
+        let Some(coll_schema) = schema.collections.get(&collection) else {
+            error::BadRequest {
+                e: "unknown collection",
+            }
+            .fail()?
+        };
+        let plan = match (query, plan) {
+            (None, None) => error::BadRequest {
+                e: "neither plan, nor query were provided",
+            }
+            .fail()?,
+            (None, Some(plan)) => Plan::from_str(&collection, coll_schema, plan)?,
+            (Some(query), _) => Plan::from_query(&collection, coll_schema, query)?,
+        };
+
+        let tx = self.fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let mut result = plan.execute(&tx);
+        let mut affected = 0;
+        while let Some(doc) = result.next().await {
+            affected += 1;
+            todo!()
+        }
+        Ok(affected)
     }
 
     /// queries single doc by id
