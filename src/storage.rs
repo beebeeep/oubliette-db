@@ -3,6 +3,7 @@ use std::{collections::HashMap, sync::Arc};
 use crate::{
     document::{DocID, Document},
     error::{self, AppError, MPVDecode},
+    expression::Update,
     planner::Plan,
     schema::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_PK, SPACE_DATA,
@@ -216,6 +217,7 @@ impl DB {
         plan: Option<&str>,
         update: &str,
     ) -> Result<usize, AppError> {
+        let collection_subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
         let collection = Collection::from((db, collection));
         let schema = self.schema.read().await;
         let Some(coll_schema) = schema.collections.get(&collection) else {
@@ -224,6 +226,7 @@ impl DB {
             }
             .fail()?
         };
+
         let plan = match (query, plan) {
             (None, None) => error::BadRequest {
                 e: "neither plan, nor query were provided",
@@ -232,16 +235,36 @@ impl DB {
             (None, Some(plan)) => Plan::from_str(&collection, coll_schema, plan)?,
             (Some(query), _) => Plan::from_query(&collection, coll_schema, query)?,
         };
+        let update = Update::try_from(update)?;
 
+        let mut affected = 0;
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
-        let mut result = plan.execute(&tx);
-        let mut affected = 0;
-        while let Some(doc) = result.next().await {
-            affected += 1;
-            todo!()
+        {
+            // execute the query, iterate over its results, apply update and insert updated document back
+            let mut result = plan.execute(&tx);
+            while let Some(doc) = result.next().await {
+                let mut doc = doc?;
+                update.apply(&mut doc)?;
+                let validation_result = schema.validate_doc(&collection, &doc.value)?;
+                if validation_result.updated_collection.is_some() {
+                    error::BadRequest {
+                        e: "update cannot change collection schema",
+                    }
+                    .fail()?;
+                }
+                let key = collection_subspace.pack(&(KEY_PK, doc.id.schema, doc.id.versionstamp));
+                let mut payload = Vec::with_capacity(64);
+                rmpv::encode::write_value(&mut payload, &doc.value).context(error::MPVEncode {
+                    e: "encoding document",
+                })?;
+                tx.set(&key, &payload);
+
+                affected += 1;
+            }
         }
+        let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
         Ok(affected)
     }
 

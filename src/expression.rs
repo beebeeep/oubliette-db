@@ -2,7 +2,7 @@ use crate::{
     document::Document,
     error::{self, AppError},
     misc::{assert_len, assert_longer},
-    values::Value,
+    values::{self, Value},
 };
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
@@ -328,8 +328,16 @@ impl Update {
 
 impl AtomicUpdate {
     fn apply(&self, doc: &mut Document) -> Result<(), AppError> {
+        // Value(doc.value).update_field(".foo", |v| {
+        //     if let rmpv::Value::F32(n) = v {
+        //         *n += 1.0;
+        //     }
+        //     Ok(())
+        // })?;
         match self {
-            AtomicUpdate::Set(fld, value) => todo!(),
+            AtomicUpdate::Set(fld, value) => {
+                doc.value.update_field(&fld, |_| Ok(Some(value.clone())))
+            }
             AtomicUpdate::Add(fld, value) => todo!(),
             AtomicUpdate::Delete(fld) => todo!(),
         }

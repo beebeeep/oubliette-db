@@ -102,6 +102,46 @@ impl Value {
         }
         None
     }
+
+    pub(crate) fn update_field(
+        &mut self,
+        path: &str,
+        update: impl FnOnce(Option<&mut rmpv::Value>) -> Result<Option<rmpv::Value>, AppError>,
+    ) -> Result<(), AppError> {
+        let mut tail = &mut self.0;
+        let mut path_parts = path.split(".").skip(1).peekable();
+        while let Some(field) = path_parts.next() {
+            let last_part = path_parts.peek().is_none();
+            if let rmpv::Value::Map(items) = tail {
+                let pos = items
+                    .iter()
+                    .position(|(fname, _)| fname.as_str() == Some(field));
+                match pos {
+                    Some(v) => {
+                        if last_part {
+                            if let Some(updated) = update(Some(&mut items[v].1))? {
+                                items[v].1 = updated;
+                            }
+                            return Ok(());
+                        } else {
+                            tail = &mut items[v].1;
+                        }
+                    }
+                    None => {
+                        if last_part {
+                            if let Some(v) = update(None)? {
+                                items.push((field.into(), v));
+                            }
+                            break;
+                        } else {
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 impl<T> From<T> for Value
