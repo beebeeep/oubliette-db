@@ -74,7 +74,7 @@ impl DB {
         &self,
         db: &str,
         collection: &str,
-        doc: rmpv::Value,
+        doc: Value,
     ) -> Result<DocID, AppError> {
         let schema = self.schema.read().await;
 
@@ -112,7 +112,7 @@ impl DB {
         let key = collection.pk_subspace().pack_with_versionstamp(&kt);
 
         let mut payload = Vec::with_capacity(64);
-        rmpv::encode::write_value(&mut payload, &doc).context(error::MPVEncode {
+        rmpv::encode::write_value(&mut payload, &doc.0).context(error::MPVEncode {
             e: "encoding document",
         })?;
         tx.atomic_op(&key, &payload, MutationType::SetVersionstampedKey);
@@ -148,13 +148,13 @@ impl DB {
         collection: &Collection,
         indexes: &HashMap<String, IndexDef>,
         affected_indexes: Vec<String>,
-        doc: &rmpv::Value,
+        doc: &Value,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
             let mut idx_subspace = collection.index_subspace(&index);
             let index_def = indexes.get(&index).expect("index should exist");
             for (field, _prefix_len) in &index_def.fields {
-                let Some(value) = Value::extract_field(&field, doc) else {
+                let Some(value) = doc.extract_field(&field) else {
                     continue 'NEXT_INDEX;
                 };
                 // TODO: truncate string value to prefix_len
@@ -256,9 +256,11 @@ impl DB {
                 }
                 let key = collection_subspace.pack(&(KEY_PK, doc.id.schema, doc.id.versionstamp));
                 let mut payload = Vec::with_capacity(64);
-                rmpv::encode::write_value(&mut payload, &doc.value).context(error::MPVEncode {
-                    e: "encoding document",
-                })?;
+                rmpv::encode::write_value(&mut payload, &doc.value.0).context(
+                    error::MPVEncode {
+                        e: "encoding document",
+                    },
+                )?;
                 tx.set(&key, &payload);
 
                 affected += 1;
@@ -306,9 +308,11 @@ impl DB {
             e: "reading document",
         })? {
             Some(data) => Ok(Some(Document {
-                value: rmpv::decode::read_value(&mut data.as_ref()).context(MPVDecode {
-                    e: "decoding document",
-                })?,
+                value: rmpv::decode::read_value(&mut data.as_ref())
+                    .context(MPVDecode {
+                        e: "decoding document",
+                    })?
+                    .into(),
                 id: id.clone(),
             })),
             None => Ok(None),

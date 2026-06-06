@@ -159,7 +159,7 @@ async fn collection_query(
         .await?;
     let mut results = Vec::with_capacity(query_result.len());
     for doc in query_result {
-        if let rmpv::Value::Map(mut items) = doc.value {
+        if let rmpv::Value::Map(mut items) = doc.value.0 {
             items.push((
                 rmpv::Value::from("__id"),
                 rmpv::Value::from(String::from(&doc.id)),
@@ -178,7 +178,7 @@ async fn collection_set(
     let docs: Vec<rmpv::Value> = req.docs.into_iter().map(|v| json2mp(v)).collect();
     let mut ids = Vec::with_capacity(docs.len());
     for doc in docs {
-        ids.push(state.db.insert_doc(&db, &collection, doc).await?);
+        ids.push(state.db.insert_doc(&db, &collection, doc.into()).await?);
     }
 
     let ids = ids
@@ -216,8 +216,7 @@ async fn add_index(
 
 async fn collection_update(
     State(state): State<Arc<AppState>>,
-    Path(db): Path<String>,
-    Path(collection): Path<String>,
+    Path((db, collection)): Path<(String, String)>,
     Json(req): Json<UpdateRequest>,
 ) -> Result<Json<UpdateResponse>, AppError> {
     let documents_updated = state

@@ -1,4 +1,7 @@
-use std::cmp::Ordering;
+use std::{
+    cmp::Ordering,
+    ops::{Add, AddAssign},
+};
 
 use base64::prelude::*;
 use bytemuck::TransparentWrapper;
@@ -14,6 +17,9 @@ pub(crate) struct Value(pub(crate) rmpv::Value);
 impl Value {
     pub(crate) fn from_ref(v: &rmpv::Value) -> &Self {
         TransparentWrapper::wrap_ref(v)
+    }
+    pub(crate) fn from_mut(v: &mut rmpv::Value) -> &mut Self {
+        TransparentWrapper::wrap_mut(v)
     }
 
     pub(crate) fn from_sexpr(e: &sexpression::Expression<'_>) -> Result<Self, AppError> {
@@ -75,27 +81,27 @@ impl Value {
         }
         Ok(())
     }
-    pub(crate) fn extract_field<'a>(path: &str, value: &'a rmpv::Value) -> Option<&'a Self> {
+    pub(crate) fn extract_field<'a>(&'a self, path: &str) -> Option<&'a Self> {
         // path looks like .foo.bar.baz, split it by ".", skip 1st part
         // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
         // note that document may not contain fields referred by query, that is normal
-        let mut tail = value;
+        let mut tail = self;
         for field in path.split(".").skip(1) {
-            if let Some(v) = Self::extract_field_entry(field, tail) {
+            if let Some(v) = tail.extract_field_entry(field) {
                 tail = v;
             } else {
                 return None;
             }
         }
-        Some(Value::from_ref(tail))
+        Some(tail)
     }
 
-    fn extract_field_entry<'a>(entry: &str, value: &'a rmpv::Value) -> Option<&'a rmpv::Value> {
-        if let rmpv::Value::Map(items) = value {
+    fn extract_field_entry<'a>(&'a self, entry: &str) -> Option<&'a Self> {
+        if let rmpv::Value::Map(items) = &self.0 {
             for (k, v) in items {
                 if let Some(s) = k.as_str() {
                     if s == entry {
-                        return Some(v);
+                        return Some(Self::from_ref(v));
                     }
                 }
             }
@@ -103,10 +109,12 @@ impl Value {
         None
     }
 
+    /// update_field updates fill in place or replaces it.
+    /// if update returns Some(Value), the field will be replaced with that value
     pub(crate) fn update_field(
         &mut self,
         path: &str,
-        update: impl FnOnce(Option<&mut rmpv::Value>) -> Result<Option<rmpv::Value>, AppError>,
+        update: impl FnOnce(Option<&mut Self>) -> Result<Option<Self>, AppError>,
     ) -> Result<(), AppError> {
         let mut tail = &mut self.0;
         let mut path_parts = path.split(".").skip(1).peekable();
@@ -119,8 +127,8 @@ impl Value {
                 match pos {
                     Some(v) => {
                         if last_part {
-                            if let Some(updated) = update(Some(&mut items[v].1))? {
-                                items[v].1 = updated;
+                            if let Some(updated) = update(Some(Self::from_mut(&mut items[v].1)))? {
+                                items[v].1 = updated.0;
                             }
                             return Ok(());
                         } else {
@@ -130,13 +138,37 @@ impl Value {
                     None => {
                         if last_part {
                             if let Some(v) = update(None)? {
-                                items.push((field.into(), v));
+                                items.push((field.into(), v.0));
                             }
                             break;
                         } else {
                             return Ok(());
                         }
                     }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn delete_field(&mut self, path: &str) -> Result<(), AppError> {
+        let mut tail = &mut self.0;
+        let mut path_parts = path.split(".").skip(1).peekable();
+        while let Some(field) = path_parts.next() {
+            let last_part = path_parts.peek().is_none();
+            if let rmpv::Value::Map(items) = tail {
+                let pos = items
+                    .iter()
+                    .position(|(fname, _)| fname.as_str() == Some(field));
+                match pos {
+                    Some(v) => {
+                        if last_part {
+                            items.remove(v);
+                            return Ok(());
+                        }
+                        tail = &mut items[v].1;
+                    }
+                    None => return Ok(()),
                 }
             }
         }
@@ -202,6 +234,92 @@ impl PartialOrd for Value {
             (rmpv::Value::Integer(a), rmpv::Value::F64(b)) => cmp_f64(*b, a),
             (_, _) => None,
         }
+    }
+}
+
+impl Add for Value {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        let sum = match (self.0, rhs.0) {
+            (rmpv::Value::Integer(a), rmpv::Value::Integer(b)) => {
+                if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+                    rmpv::Value::from(a + b)
+                } else if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+                    rmpv::Value::from(a + b)
+                } else {
+                    rmpv::Value::Integer(a)
+                }
+            }
+            (rmpv::Value::String(a), rmpv::Value::String(b)) => match (a.as_str(), b.as_str()) {
+                (Some(a), Some(b)) => {
+                    let mut s = String::from(a);
+                    s.push_str(b);
+                    rmpv::Value::from(s)
+                }
+                _ => rmpv::Value::String(a),
+            },
+            (rmpv::Value::F32(a), rmpv::Value::F32(b)) => rmpv::Value::from(a + b),
+            (rmpv::Value::F64(a), rmpv::Value::F64(b)) => rmpv::Value::from(a + b),
+            (rmpv::Value::F64(a), rmpv::Value::F32(b)) => rmpv::Value::from(a + b as f64),
+            (rmpv::Value::F32(a), rmpv::Value::F64(b)) => rmpv::Value::from(a as f64 + b),
+            (rmpv::Value::F32(a), rmpv::Value::Integer(b)) => {
+                rmpv::Value::from(a as f64 + b.as_f64().unwrap_or(0.0))
+            }
+            (rmpv::Value::F64(a), rmpv::Value::Integer(b)) => {
+                rmpv::Value::from(a + b.as_f64().unwrap_or(0.0))
+            }
+            (rmpv::Value::Integer(a), rmpv::Value::F32(b)) => {
+                rmpv::Value::from(a.as_f64().unwrap_or(0.0) + b as f64)
+            }
+            (rmpv::Value::Integer(a), rmpv::Value::F64(b)) => {
+                rmpv::Value::from(a.as_f64().unwrap_or(0.0) + b)
+            }
+            (v, _) => v,
+        };
+        sum.into()
+    }
+}
+
+impl AddAssign for Value {
+    fn add_assign(&mut self, rhs: Self) {
+        let sum = match (&mut self.0, rhs.0) {
+            (rmpv::Value::Integer(a), rmpv::Value::Integer(b)) => {
+                if let (Some(a), Some(b)) = (a.as_i64(), b.as_i64()) {
+                    rmpv::Value::from(a + b)
+                } else if let (Some(a), Some(b)) = (a.as_u64(), b.as_u64()) {
+                    rmpv::Value::from(a + b)
+                } else {
+                    rmpv::Value::Integer(*a)
+                }
+            }
+            (rmpv::Value::String(a), rmpv::Value::String(b)) => match (a.as_str(), b.as_str()) {
+                (Some(a), Some(b)) => {
+                    let mut s = String::from(a);
+                    s.push_str(b);
+                    rmpv::Value::from(s)
+                }
+                _ => rmpv::Value::String(a.clone()),
+            },
+            (rmpv::Value::F32(a), rmpv::Value::F32(b)) => rmpv::Value::from(*a + b),
+            (rmpv::Value::F64(a), rmpv::Value::F64(b)) => rmpv::Value::from(*a + b),
+            (rmpv::Value::F64(a), rmpv::Value::F32(b)) => rmpv::Value::from(*a + b as f64),
+            (rmpv::Value::F32(a), rmpv::Value::F64(b)) => rmpv::Value::from(*a as f64 + b),
+            (rmpv::Value::F32(a), rmpv::Value::Integer(b)) => {
+                rmpv::Value::from(*a as f64 + b.as_f64().unwrap_or(0.0))
+            }
+            (rmpv::Value::F64(a), rmpv::Value::Integer(b)) => {
+                rmpv::Value::from(*a + b.as_f64().unwrap_or(0.0))
+            }
+            (rmpv::Value::Integer(a), rmpv::Value::F32(b)) => {
+                rmpv::Value::from(a.as_f64().unwrap_or(0.0) + b as f64)
+            }
+            (rmpv::Value::Integer(a), rmpv::Value::F64(b)) => {
+                rmpv::Value::from(a.as_f64().unwrap_or(0.0) + b)
+            }
+            (v, _) => v.clone(),
+        };
+        *self = Self::from(sum)
     }
 }
 

@@ -88,7 +88,7 @@ impl IndexDef {
 
     pub(crate) fn get_key(&self, mut subspace: Subspace, doc: &Document) -> Option<Vec<u8>> {
         for field in self.fields.iter() {
-            let Some(value) = Value::extract_field(&field.0, &doc.value) else {
+            let Some(value) = doc.value.extract_field(&field.0) else {
                 return None;
             };
             subspace = match (value, field.1) {
@@ -247,9 +247,9 @@ impl InstanceSchema {
     pub(crate) fn validate_doc(
         &self,
         collection: &Collection,
-        doc: &rmpv::Value,
+        doc: &Value,
     ) -> Result<ValidationResult, AppError> {
-        let rmpv::Value::Map(doc) = doc else {
+        let rmpv::Value::Map(obj) = &doc.0 else {
             error::Validation {
                 e: "document must be an object",
             }
@@ -268,7 +268,7 @@ impl InstanceSchema {
             })?;
 
         let (referred_fields, new_fields) = Self::validate_object(
-            doc,
+            obj,
             String::from(""),
             &coll.fields,
             Vec::with_capacity(coll.fields.len()),
@@ -389,11 +389,11 @@ mod tests {
 
     use crate::{
         schema::{Collection, CollectionSchema, DataType, IndexDef, InstanceSchema},
-        values::json2mp,
+        values::{Value, json2mp},
     };
 
-    fn j(s: &str) -> rmpv::Value {
-        json2mp(serde_json::from_str(s).unwrap())
+    fn j(s: &str) -> Value {
+        json2mp(serde_json::from_str(s).unwrap()).into()
     }
 
     #[test]

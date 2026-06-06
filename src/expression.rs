@@ -1,3 +1,5 @@
+use std::ops::Add;
+
 use crate::{
     document::Document,
     error::{self, AppError},
@@ -42,7 +44,7 @@ pub(crate) struct AtomicPredicate {
 
 impl AtomicPredicate {
     fn evaluate(&self, doc: &Document) -> bool {
-        let Some(lhs) = Value::extract_field(&self.fld, &doc.value) else {
+        let Some(lhs) = doc.value.extract_field(&self.fld) else {
             return false;
         };
         let rhs = &self.val;
@@ -275,7 +277,7 @@ impl TryFrom<&sexpression::Expression<'_>> for AtomicUpdate {
             }
             .fail()?
         };
-        assert_longer(args, 2)?;
+        assert_longer(args, 1)?;
         match &args[0] {
             Sexpr::Symbol("add") => {
                 assert_len(args, 3)?;
@@ -328,18 +330,17 @@ impl Update {
 
 impl AtomicUpdate {
     fn apply(&self, doc: &mut Document) -> Result<(), AppError> {
-        // Value(doc.value).update_field(".foo", |v| {
-        //     if let rmpv::Value::F32(n) = v {
-        //         *n += 1.0;
-        //     }
-        //     Ok(())
-        // })?;
         match self {
             AtomicUpdate::Set(fld, value) => {
                 doc.value.update_field(&fld, |_| Ok(Some(value.clone())))
             }
-            AtomicUpdate::Add(fld, value) => todo!(),
-            AtomicUpdate::Delete(fld) => todo!(),
+            AtomicUpdate::Add(fld, value) => doc.value.update_field(&fld, |v| {
+                if let Some(v) = v {
+                    *v += value.clone();
+                }
+                Ok(None)
+            }),
+            AtomicUpdate::Delete(fld) => doc.value.delete_field(&fld),
         }
     }
 }
@@ -389,11 +390,11 @@ mod tests {
         let p = Predicate::try_from("(eq .foo 137)").unwrap();
         let mut doc = Document {
             id: DocID::default(),
-            value: json2mp(json!({})),
+            value: json2mp(json!({})).into(),
         };
         assert!(!p.evaluate(&doc));
 
-        doc.value = json2mp(json!({"foo": 137, "bar": "chlos", "baz": {"baq": 300}}));
+        doc.value = json2mp(json!({"foo": 137, "bar": "chlos", "baz": {"baq": 300}})).into();
         assert!(p.evaluate(&doc));
 
         let p = Predicate::try_from("(gt .foo 0)").unwrap();

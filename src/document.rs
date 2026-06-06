@@ -9,6 +9,7 @@ use snafu::ResultExt;
 use crate::{
     error::{self, AppError, MPVDecode},
     schema::SchemaVersion,
+    values::Value,
 };
 
 #[derive(Debug, Clone)]
@@ -19,7 +20,7 @@ pub(crate) struct DocID {
 
 pub(crate) struct Document {
     pub(crate) id: DocID,
-    pub(crate) value: rmpv::Value,
+    pub(crate) value: Value,
 }
 
 impl Default for DocID {
@@ -112,9 +113,11 @@ impl TryFrom<(&[u8], &[u8])> for Document {
                 .context(error::FdbTupleUnpack)?;
         Ok(Self {
             id: DocID::new(schema_version, versionstamp),
-            value: rmpv::decode::read_value(&mut kv.1.as_ref()).context(MPVDecode {
-                e: "decoding document",
-            })?,
+            value: rmpv::decode::read_value(&mut kv.1.as_ref())
+                .context(MPVDecode {
+                    e: "decoding document",
+                })?
+                .into(),
         })
     }
 }
