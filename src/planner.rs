@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use foundationdb::{
     KeySelector, RangeOption, Transaction,
     tuple::{self},
@@ -25,8 +27,9 @@ pub(crate) type DocumentStream<'a> = stream::BoxStream<'a, Result<Document, AppE
 pub(crate) enum Plan<'a> {
     Union(Vec<Plan<'a>>),   // (union (subplan1) (subplan2) ...)
     Filter(Filter<'a>),     // (filter (subplan) (filter-expr))
+    PkScan(PkScan<'a>),     // (get_id "document_id")
     Fullscan(Fullscan<'a>), // (scan (filter-expr))
-    IdxScan(IdxScan<'a>), // (idxscan (idx-field1-predicate) (idx-field2-predicate) ...), different predicates are intersected (i.e. joined by AND)
+    IxScan(IxScan<'a>),     // (ixscan (op idx_name (field1_value, field2_value, ...)))
 }
 
 pub(crate) struct Filter<'a> {
@@ -34,7 +37,12 @@ pub(crate) struct Filter<'a> {
     expr: Predicate,
 }
 
-pub(crate) struct IdxScan<'a> {
+pub(crate) struct PkScan<'a> {
+    collection: &'a Collection,
+    id: DocID,
+}
+
+pub(crate) struct IxScan<'a> {
     collection: &'a Collection,
     range: RangeOption<'a>,
 }
@@ -42,6 +50,36 @@ pub(crate) struct IdxScan<'a> {
 pub(crate) struct Fullscan<'a> {
     collection: &'a Collection,
     filter: Predicate,
+}
+
+impl<'a> PkScan<'a> {
+    fn from_expr(expr: &Sexpr, collection: &'a Collection) -> Result<Self, AppError> {
+        let Sexpr::Str(id) = expr else {
+            return error::BadRequest {
+                e: "get_id argument must be string",
+            }
+            .fail()?;
+        };
+        Ok(Self {
+            collection,
+            id: DocID::try_from(*id)?,
+        })
+    }
+
+    fn execute(&self, tx: &Transaction) -> impl Stream<Item = Result<Document, AppError>> {
+        let s = Cow::from(self.collection.pk_subspace().pack(&self.id));
+        let opt = RangeOption {
+            begin: KeySelector::first_greater_or_equal(s.clone()),
+            end: KeySelector::first_greater_than(s),
+            ..Default::default()
+        };
+        tx.get_ranges_keyvalues(opt, false)
+            .map_err(|e| AppError::Fdb {
+                e: String::from("scanning collection"),
+                source: e,
+            })
+            .try_filter_map(async |value| Ok(Some(Document::try_from(value)?)))
+    }
 }
 
 impl<'a> Fullscan<'a> {
@@ -70,7 +108,7 @@ impl<'a> Fullscan<'a> {
     }
 }
 
-impl<'a> IdxScan<'a> {
+impl<'a> IxScan<'a> {
     fn from_expr(
         expr: &Sexpr,
         collection: &'a Collection,
@@ -103,6 +141,7 @@ impl<'a> IdxScan<'a> {
                 // (ixscan (eq idx_name (137 "foo")))
                 let (idx_space_begin, idx_space_end) = collection.index_subspace(idx_name).range();
                 let mut idx_subspace = collection.index_subspace(idx_name);
+                // TODO: shall we allow less fields than there are in index?
                 if index.fields.len() != op_values.len() {
                     return error::BadRequest {
                         e: format!(
@@ -287,9 +326,13 @@ impl<'a> Plan<'a> {
     ) -> Result<Self, AppError> {
         match list.get(0) {
             Some(Sexpr::Symbol(op)) => match *op {
+                "get_id" => {
+                    assert_len(&list, 2)?;
+                    Ok(Self::PkScan(PkScan::from_expr(&list[1], collection)?))
+                }
                 "ixscan" => {
                     assert_len(&list, 2)?;
-                    Ok(Self::IdxScan(IdxScan::from_expr(
+                    Ok(Self::IxScan(IxScan::from_expr(
                         &list[1], collection, schema,
                     )?))
                 }
@@ -343,7 +386,8 @@ impl<'a> Plan<'a> {
                 })
                 .boxed(),
             Plan::Fullscan(fullscan) => fullscan.execute(tx).boxed(),
-            Plan::IdxScan(idx_scan) => idx_scan.execute(tx).boxed(),
+            Plan::PkScan(pkscan) => pkscan.execute(tx).boxed(),
+            Plan::IxScan(idx_scan) => idx_scan.execute(tx).boxed(),
         }
     }
 }

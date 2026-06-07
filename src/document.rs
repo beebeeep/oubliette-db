@@ -86,6 +86,12 @@ impl DocID {
             versionstamp,
         }
     }
+    pub(crate) fn incomplete(schema: SchemaVersion) -> Self {
+        Self {
+            schema,
+            versionstamp: Versionstamp::incomplete(0),
+        }
+    }
 }
 
 impl TryFrom<&FdbKeyValue> for Document {
@@ -119,5 +125,30 @@ impl TryFrom<(&[u8], &[u8])> for Document {
                 })?
                 .into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use foundationdb::tuple::{self, Subspace, Versionstamp};
+
+    use crate::{document::DocID, schema::Collection};
+
+    #[test]
+    fn test_doc_id() {
+        let d = DocID::try_from("04000000000000003280028900000000").expect("failed to parse docID");
+        assert_eq!(d.schema, 4);
+
+        let d = DocID::new(
+            137,
+            Versionstamp::complete([1, 2, 3, 4, 5, 6, 7, 8, 9, 0], 0),
+        );
+        let coll = Collection {
+            db: Box::from("testdb"),
+            collection: Box::from("testcol"),
+        };
+        let key1 = coll.pk_subspace().pack(&(&d.schema, &d.versionstamp));
+        let key2 = coll.pk_subspace().pack(&d);
+        assert_eq!(key2, key1);
     }
 }

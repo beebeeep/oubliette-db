@@ -15,7 +15,7 @@ use crate::{
 use foundationdb::{
     Transaction,
     options::MutationType,
-    tuple::{Subspace, Versionstamp},
+    tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
@@ -108,8 +108,9 @@ impl DB {
             e: "starting transaction",
         })?;
 
-        let kt = (schema.version, &Versionstamp::incomplete(0));
-        let key = collection.pk_subspace().pack_with_versionstamp(&kt);
+        let key = collection
+            .pk_subspace()
+            .pack_with_versionstamp(&DocID::incomplete(schema.version));
 
         let mut payload = Vec::with_capacity(64);
         rmpv::encode::write_value(&mut payload, &doc.0).context(error::MPVEncode {
@@ -160,8 +161,8 @@ impl DB {
                 // TODO: truncate string value to prefix_len
                 idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
             }
-            let key = idx_subspace
-                .pack_with_versionstamp(&(schema_version, &Versionstamp::incomplete(0)));
+            let key = idx_subspace.pack_with_versionstamp(&DocID::incomplete(schema_version));
+            // .pack_with_versionstamp(&(schema_version, &Versionstamp::incomplete(0)));
             tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
         }
         Ok(())
@@ -245,8 +246,15 @@ impl DB {
             // execute the query, iterate over its results, apply update and insert updated document back
             let mut result = plan.execute(&tx);
             while let Some(doc) = result.next().await {
+                affected += 1;
                 let mut doc = doc?;
-                update.apply(&mut doc)?;
+                // TODO: update shall update index too!
+                let drop = update.apply(&mut doc)?;
+                let key = collection_subspace.pack(&(KEY_PK, &doc.id.schema, &doc.id.versionstamp));
+                if drop {
+                    self.drop_document(&schema, &collection, &key, &doc, &tx);
+                    continue;
+                }
                 let validation_result = schema.validate_doc(&collection, &doc.value)?;
                 if validation_result.updated_collection.is_some() {
                     error::BadRequest {
@@ -254,7 +262,6 @@ impl DB {
                     }
                     .fail()?;
                 }
-                let key = collection_subspace.pack(&(KEY_PK, doc.id.schema, doc.id.versionstamp));
                 let mut payload = Vec::with_capacity(64);
                 rmpv::encode::write_value(&mut payload, &doc.value.0).context(
                     error::MPVEncode {
@@ -262,8 +269,6 @@ impl DB {
                     },
                 )?;
                 tx.set(&key, &payload);
-
-                affected += 1;
             }
         }
         let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
@@ -278,8 +283,10 @@ impl DB {
         id: impl TryInto<DocID, Error = AppError>,
     ) -> Result<Option<rmpv::Value>, AppError> {
         let id = id.try_into()?;
-        let subspace = Subspace::all().subspace(&(SPACE_DATA, db, collection));
-        let key = subspace.pack(&(KEY_PK, id.schema, id.versionstamp));
+        // avoid building Collection to save on boxing stuff
+        let key = Subspace::all()
+            .subspace(&(SPACE_DATA, db, collection, KEY_PK))
+            .pack(&id);
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
         })?;
@@ -361,6 +368,31 @@ impl DB {
             .await?;
         Ok(())
     }
+
+    fn drop_document(
+        &self,
+        schema: &InstanceSchema,
+        collection: &Collection,
+        key: &[u8],
+        doc: &Document,
+        tx: &Transaction,
+    ) {
+        tx.clear(key);
+        /*
+        let Some(col_schema) = schema.collections.get(collection) else {
+            return;
+        };
+        for (idx_name, idx) in &col_schema.indexes {
+            let mut subspace = collection.index_subspace(&idx_name);
+            for (field, _size) in &idx.fields {
+                let Some(value) = doc.value.extract_field(field) else {
+                    continue;
+                };
+                subspace = subspace.subspace(value);
+            }
+        }
+        */
+    }
 }
 
 #[allow(dead_code)]
@@ -374,15 +406,4 @@ fn dump_key(key: &[u8]) -> String {
         }
     }
     r
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::document::DocID;
-
-    #[test]
-    fn test_doc_id() {
-        let d = DocID::try_from("04000000000000003280028900000000").expect("failed to parse docID");
-        assert_eq!(d.schema, 4);
-    }
 }

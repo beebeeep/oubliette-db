@@ -14,6 +14,7 @@ enum AtomicUpdate {
     Set(Box<str>, Value),
     Add(Box<str>, Value),
     Delete(Box<str>),
+    Drop(),
     //Push(Value), TODO: once we add support of arrays
 }
 
@@ -277,7 +278,7 @@ impl TryFrom<&sexpression::Expression<'_>> for AtomicUpdate {
             }
             .fail()?
         };
-        assert_longer(args, 1)?;
+        assert_longer(args, 0)?;
         match &args[0] {
             Sexpr::Symbol("add") => {
                 assert_len(args, 3)?;
@@ -311,6 +312,10 @@ impl TryFrom<&sexpression::Expression<'_>> for AtomicUpdate {
                 };
                 Ok(Self::Delete(fld.into()))
             }
+            Sexpr::Symbol("drop") => {
+                assert_len(args, 1)?;
+                Ok(Self::Drop())
+            }
             v => error::BadRequest {
                 e: format!("update expression syntax error: unexpected token {v:?}"),
             }
@@ -320,27 +325,37 @@ impl TryFrom<&sexpression::Expression<'_>> for AtomicUpdate {
 }
 
 impl Update {
-    pub(crate) fn apply(&self, doc: &mut Document) -> Result<(), AppError> {
+    /// apply modifies document according the update query. If it returns Ok(true), the document shall be dropped
+    pub(crate) fn apply(&self, doc: &mut Document) -> Result<bool, AppError> {
+        let mut drop = false;
         for u in &self.0 {
-            u.apply(doc)?;
+            drop = drop || u.apply(doc)?;
         }
-        Ok(())
+        Ok(drop)
     }
 }
 
 impl AtomicUpdate {
-    fn apply(&self, doc: &mut Document) -> Result<(), AppError> {
+    fn apply(&self, doc: &mut Document) -> Result<bool, AppError> {
         match self {
             AtomicUpdate::Set(fld, value) => {
-                doc.value.update_field(&fld, |_| Ok(Some(value.clone())))
+                doc.value.update_field(&fld, |_| Ok(Some(value.clone())))?;
+                Ok(false)
             }
-            AtomicUpdate::Add(fld, value) => doc.value.update_field(&fld, |v| {
-                if let Some(v) = v {
-                    *v += value.clone();
-                }
-                Ok(None)
-            }),
-            AtomicUpdate::Delete(fld) => doc.value.delete_field(&fld),
+            AtomicUpdate::Add(fld, value) => {
+                doc.value.update_field(&fld, |v| {
+                    if let Some(v) = v {
+                        *v += value.clone();
+                    }
+                    Ok(None)
+                })?;
+                Ok(false)
+            }
+            AtomicUpdate::Delete(fld) => {
+                doc.value.delete_field(&fld)?;
+                Ok(false)
+            }
+            AtomicUpdate::Drop() => Ok(true),
         }
     }
 }
