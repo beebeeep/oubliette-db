@@ -42,8 +42,8 @@ pub(crate) struct InstanceSchema {
 
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub(crate) struct CollectionSchema {
-    pub(crate) fields: HashMap<String, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
-    pub(crate) indexes: HashMap<String, IndexDef>,
+    pub(crate) fields: HashMap<Box<str>, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
+    pub(crate) indexes: HashMap<Box<str>, IndexDef>,
 }
 
 /// field name and prefix length in bytes (utf-8 strings are truncated to closest char boundary)
@@ -75,20 +75,22 @@ pub(crate) enum SchemaUpdate {
 
 pub(crate) struct ValidationResult {
     pub(crate) updated_collection: Option<CollectionSchema>,
-    pub(crate) affected_indexes: Option<Vec<String>>,
+    pub(crate) affected_indexes: Option<Vec<Box<str>>>,
 }
 
-type NewFields = Vec<(String, DataType)>;
-type ReferredFields = Vec<String>;
+type NewFields = Vec<(Box<str>, DataType)>;
+type ReferredFields = Vec<Box<str>>;
 
 impl IndexDef {
     fn contains(&self, field: &str) -> bool {
         self.fields.iter().any(|(idx_field, _)| idx_field == field)
     }
 
-    pub(crate) fn get_key(&self, mut subspace: Subspace, doc: &Document) -> Option<Vec<u8>> {
+    /// Constructs index subspace by appending all indexed field values to the root index key.
+    /// To get index key, pack document ID into resulted subspace.
+    pub(crate) fn subspace(&self, mut subspace: Subspace, doc: &Value) -> Option<Subspace> {
         for field in self.fields.iter() {
-            let Some(value) = doc.value.extract_field(&field.0) else {
+            let Some(value) = doc.extract_field(&field.0) else {
                 return None;
             };
             subspace = match (value, field.1) {
@@ -102,7 +104,7 @@ impl IndexDef {
                 (v, _) => subspace.subspace(v),
             };
         }
-        Some(subspace.pack(&doc.id))
+        Some(subspace)
     }
 }
 
@@ -209,14 +211,14 @@ impl InstanceSchema {
                         .context(error::BadRequest {
                             e: "collection does not exist",
                         })?;
-                if col.indexes.contains_key(&name) {
+                if col.indexes.contains_key(name.as_str()) {
                     error::BadRequest {
                         e: "index already exists",
                     }
                     .fail()?;
                 }
 
-                col.indexes.insert(name, index);
+                col.indexes.insert(name.into_boxed_str(), index);
             }
         }
 
@@ -269,7 +271,7 @@ impl InstanceSchema {
 
         let (referred_fields, new_fields) = Self::validate_object(
             obj,
-            String::from(""),
+            "",
             &coll.fields,
             Vec::with_capacity(coll.fields.len()),
             None,
@@ -304,8 +306,8 @@ impl InstanceSchema {
     /// Takes MessagePack map items and recursively travereses through it, accumulating field names and their types
     fn validate_object(
         obj: &[(rmpv::Value, rmpv::Value)],
-        prefix: String,
-        fields: &HashMap<String, DataType>,
+        prefix: &str,
+        fields: &HashMap<Box<str>, DataType>,
         mut referred_fields: ReferredFields,
         mut new_fields: Option<NewFields>,
     ) -> Result<(ReferredFields, Option<NewFields>), AppError> {
@@ -330,7 +332,7 @@ impl InstanceSchema {
                 .fail()?;
             }
 
-            let field_name = format!("{prefix}.{field_name}");
+            let field_name = format!("{prefix}.{field_name}").into_boxed_str();
             let field_type = match value {
                 rmpv::Value::F32(_) => Some(DataType::Float),
                 rmpv::Value::F64(_) => Some(DataType::Float),
@@ -340,7 +342,7 @@ impl InstanceSchema {
                 rmpv::Value::Map(items) => {
                     (referred_fields, new_fields) = Self::validate_object(
                         items,
-                        field_name.clone(),
+                        &field_name,
                         fields,
                         referred_fields,
                         new_fields,
@@ -407,7 +409,7 @@ mod tests {
                     fields: HashMap::new(),
                     indexes: HashMap::from([
                         (
-                            String::from("idx_foo"),
+                            Box::new("idx_foo"),
                             IndexDef {
                                 fields: vec![(String::from(".foo"), Some(0))],
                                 ready: true,
@@ -416,7 +418,7 @@ mod tests {
                             },
                         ),
                         (
-                            String::from("idx_foo_barbaz"),
+                            Box::new("idx_foo_barbaz"),
                             IndexDef {
                                 fields: vec![
                                     (String::from(".foo"), Some(0)),

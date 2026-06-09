@@ -4,10 +4,12 @@ use crate::{
     document::Document,
     error::{self, AppError},
     misc::{assert_len, assert_longer},
+    schema::CollectionSchema,
     values::{self, Value},
 };
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
+use tracing::instrument::WithSubscriber;
 
 pub(crate) struct Update(Vec<AtomicUpdate>);
 enum AtomicUpdate {
@@ -332,6 +334,25 @@ impl Update {
             drop = drop || u.apply(doc)?;
         }
         Ok(drop)
+    }
+
+    pub(crate) fn get_affected_indexes<'a>(&'a self, schema: &'a CollectionSchema) -> Vec<&'a str> {
+        let mut r = Vec::new();
+        for u in &self.0 {
+            match u {
+                AtomicUpdate::Set(fld, _) => r.push(fld.as_ref()),
+                AtomicUpdate::Add(fld, _) => r.push(fld.as_ref()),
+                AtomicUpdate::Delete(fld) => r.push(fld.as_ref()),
+                AtomicUpdate::Drop() => {
+                    for (_, def) in &schema.indexes {
+                        for (fld, _) in &def.fields {
+                            r.push(fld.as_str());
+                        }
+                    }
+                }
+            }
+        }
+        r
     }
 }
 

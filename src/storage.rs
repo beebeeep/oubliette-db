@@ -124,7 +124,7 @@ impl DB {
                 schema.version,
                 &collection,
                 indexes,
-                affected_indexes,
+                &affected_indexes,
                 &doc,
             )?;
         }
@@ -147,23 +147,48 @@ impl DB {
         tx: &foundationdb::Transaction,
         schema_version: SchemaVersion,
         collection: &Collection,
-        indexes: &HashMap<String, IndexDef>,
-        affected_indexes: Vec<String>,
+        indexes: &HashMap<Box<str>, IndexDef>,
+        affected_indexes: &[Box<str>],
         doc: &Value,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
-            let mut idx_subspace = collection.index_subspace(&index);
-            let index_def = indexes.get(&index).expect("index should exist");
-            for (field, _prefix_len) in &index_def.fields {
-                let Some(value) = doc.extract_field(&field) else {
-                    continue 'NEXT_INDEX;
-                };
-                // TODO: truncate string value to prefix_len
-                idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
-            }
-            let key = idx_subspace.pack_with_versionstamp(&DocID::incomplete(schema_version));
-            // .pack_with_versionstamp(&(schema_version, &Versionstamp::incomplete(0)));
+            let idx_subspace = collection.index_subspace(&index);
+            let index_def = indexes.get(index).expect("index should exist");
+            // for (field, _prefix_len) in &index_def.fields {
+            //     let Some(value) = doc.extract_field(&field) else {
+            //         continue 'NEXT_INDEX;
+            //     };
+            //     // TODO: truncate string value to prefix_len
+            //     idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
+            // }
+            // let key = idx_subspace.pack_with_versionstamp(&DocID::incomplete(schema_version));
+            let Some(subspace) = index_def.subspace(idx_subspace, doc) else {
+                continue 'NEXT_INDEX;
+            };
+            let key = subspace.pack(&DocID::incomplete(schema_version));
             tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
+        }
+        Ok(())
+    }
+
+    fn update_indexes<'a>(
+        tx: &foundationdb::Transaction,
+        collection: &Collection,
+        indexes: &HashMap<Box<str>, IndexDef>,
+        affected_indexes: &[&str],
+        doc: &Document,
+        drop: bool,
+    ) -> Result<(), AppError> {
+        'NEXT_INDEX: for index in affected_indexes {
+            let idx_subspace = collection.index_subspace(&index);
+            let index_def = indexes.get(*index).expect("index should exist");
+            let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
+                continue 'NEXT_INDEX;
+            };
+            let key = subspace.pack(&doc.id);
+            if drop {
+                tx.clear(&key);
+            }
         }
         Ok(())
     }
@@ -245,10 +270,19 @@ impl DB {
         {
             // execute the query, iterate over its results, apply update and insert updated document back
             let mut result = plan.execute(&tx);
+            let affected_indexes = update.get_affected_indexes(coll_schema);
             while let Some(doc) = result.next().await {
                 affected += 1;
                 let mut doc = doc?;
                 // TODO: update shall update index too!
+                Self::update_indexes(
+                    &tx,
+                    &collection,
+                    &coll_schema.indexes,
+                    &affected_indexes,
+                    &doc,
+                    false,
+                );
                 let drop = update.apply(&mut doc)?;
                 let key = collection_subspace.pack(&(KEY_PK, &doc.id.schema, &doc.id.versionstamp));
                 if drop {

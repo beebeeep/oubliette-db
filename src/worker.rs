@@ -73,7 +73,7 @@ impl Worker {
                 }
                 let coll = collection.clone();
                 let db_path = self.db_path.clone();
-                let idx_name = String::from(index_name);
+                let idx_name = index_name.clone();
                 tokio::task::spawn(async move {
                     if let Err(e) = materialize_index(db_path, schema_version, coll, idx_name).await
                     {
@@ -91,7 +91,7 @@ async fn materialize_index(
     db_path: String,
     schema_version: u32,
     collection: Collection,
-    index_name: String,
+    index_name: Box<str>,
 ) -> Result<(), AppError> {
     info!(index = index_name, "materializing index");
     let fdb =
@@ -175,10 +175,10 @@ async fn materialize_index_batch(
             let doc = Document::try_from(value)?;
             let index_ss = collection.index_subspace(&index_name);
 
-            // construct index key by appending all indexed field values to the root index key
-            let Some(key) = index_def.get_key(index_ss, &doc) else {
+            let Some(subspace) = index_def.subspace(index_ss, &doc.value) else {
                 continue 'VALUES;
             };
+            let key = subspace.pack(&doc.id);
             tx.set(&key, &[]);
             doc_count += 1;
             if doc_count > MAX_OPS_PER_TX {
