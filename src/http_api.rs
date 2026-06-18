@@ -205,7 +205,7 @@ async fn add_index(
     let fields = req
         .fields
         .into_iter()
-        .map(|f| (f.field.into_string(), f.prefix_length))
+        .map(|f| (f.field, f.prefix_length))
         .collect();
     state
         .db

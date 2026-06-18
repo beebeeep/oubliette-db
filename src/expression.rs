@@ -1,4 +1,4 @@
-use std::ops::Add;
+use std::{collections::HashSet, ops::Add};
 
 use crate::{
     document::Document,
@@ -336,23 +336,32 @@ impl Update {
         Ok(drop)
     }
 
-    pub(crate) fn get_affected_indexes<'a>(&'a self, schema: &'a CollectionSchema) -> Vec<&'a str> {
-        let mut r = Vec::new();
+    pub(crate) fn get_affected_indexes<'a>(
+        &'a self,
+        schema: &'a CollectionSchema,
+    ) -> Vec<Box<str>> {
+        let mut r = HashSet::new();
         for u in &self.0 {
             match u {
-                AtomicUpdate::Set(fld, _) => r.push(fld.as_ref()),
-                AtomicUpdate::Add(fld, _) => r.push(fld.as_ref()),
-                AtomicUpdate::Delete(fld) => r.push(fld.as_ref()),
+                AtomicUpdate::Set(fld, _) => {
+                    r.insert(fld.clone());
+                }
+                AtomicUpdate::Add(fld, _) => {
+                    r.insert(fld.clone());
+                }
+                AtomicUpdate::Delete(fld) => {
+                    r.insert(fld.clone());
+                }
                 AtomicUpdate::Drop() => {
                     for (_, def) in &schema.indexes {
                         for (fld, _) in &def.fields {
-                            r.push(fld.as_str());
+                            r.insert(fld.clone());
                         }
                     }
                 }
             }
         }
-        r
+        r.into_iter().collect()
     }
 }
 

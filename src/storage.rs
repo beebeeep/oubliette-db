@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     document::{DocID, Document},
@@ -108,25 +111,20 @@ impl DB {
             e: "starting transaction",
         })?;
 
-        let key = collection
-            .pk_subspace()
-            .pack_with_versionstamp(&DocID::incomplete(schema.version));
+        let mut doc = Document {
+            id: DocID::incomplete(schema.version),
+            value: doc,
+        };
+        let key = collection.pk_subspace().pack_with_versionstamp(&doc.id);
 
         let mut payload = Vec::with_capacity(64);
-        rmpv::encode::write_value(&mut payload, &doc.0).context(error::MPVEncode {
+        rmpv::encode::write_value(&mut payload, &doc.value.0).context(error::MPVEncode {
             e: "encoding document",
         })?;
         tx.atomic_op(&key, &payload, MutationType::SetVersionstampedKey);
 
         if let Some(affected_indexes) = validation_result.affected_indexes {
-            Self::write_indexes(
-                &tx,
-                schema.version,
-                &collection,
-                indexes,
-                &affected_indexes,
-                &doc,
-            )?;
+            Self::write_indexes(&tx, &collection, indexes, &affected_indexes, &doc)?;
         }
 
         let versiontstamp = tx.get_versionstamp();
@@ -138,18 +136,17 @@ impl DB {
             .as_ref()
             .try_into()
             .whatever_context("invalid versionstamp")?;
-        let versionstamp = Versionstamp::complete(versionstamp, 0);
+        doc.id.versionstamp = Versionstamp::complete(versionstamp, 0);
 
-        Ok(DocID::new(schema.version, versionstamp))
+        Ok(doc.id)
     }
 
     fn write_indexes(
         tx: &foundationdb::Transaction,
-        schema_version: SchemaVersion,
         collection: &Collection,
         indexes: &HashMap<Box<str>, IndexDef>,
         affected_indexes: &[Box<str>],
-        doc: &Value,
+        doc: &Document,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
             let idx_subspace = collection.index_subspace(&index);
@@ -162,33 +159,30 @@ impl DB {
             //     idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
             // }
             // let key = idx_subspace.pack_with_versionstamp(&DocID::incomplete(schema_version));
-            let Some(subspace) = index_def.subspace(idx_subspace, doc) else {
+            let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
-            let key = subspace.pack(&DocID::incomplete(schema_version));
+            let key = subspace.pack(&doc.id);
             tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
         }
         Ok(())
     }
 
-    fn update_indexes<'a>(
+    fn delete_indexes<'a>(
         tx: &foundationdb::Transaction,
         collection: &Collection,
         indexes: &HashMap<Box<str>, IndexDef>,
-        affected_indexes: &[&str],
+        affected_indexes: &[Box<str>],
         doc: &Document,
-        drop: bool,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
             let idx_subspace = collection.index_subspace(&index);
-            let index_def = indexes.get(*index).expect("index should exist");
+            let index_def = indexes.get(index).expect("index should exist");
             let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
             let key = subspace.pack(&doc.id);
-            if drop {
-                tx.clear(&key);
-            }
+            tx.clear(&key);
         }
         Ok(())
     }
@@ -274,15 +268,13 @@ impl DB {
             while let Some(doc) = result.next().await {
                 affected += 1;
                 let mut doc = doc?;
-                // TODO: update shall update index too!
-                Self::update_indexes(
+                Self::delete_indexes(
                     &tx,
                     &collection,
                     &coll_schema.indexes,
                     &affected_indexes,
                     &doc,
-                    false,
-                );
+                )?;
                 let drop = update.apply(&mut doc)?;
                 let key = collection_subspace.pack(&(KEY_PK, &doc.id.schema, &doc.id.versionstamp));
                 if drop {
@@ -296,6 +288,13 @@ impl DB {
                     }
                     .fail()?;
                 }
+                Self::write_indexes(
+                    &tx,
+                    &collection,
+                    &coll_schema.indexes,
+                    &affected_indexes,
+                    &doc,
+                )?;
                 let mut payload = Vec::with_capacity(64);
                 rmpv::encode::write_value(&mut payload, &doc.value.0).context(
                     error::MPVEncode {
@@ -389,7 +388,7 @@ impl DB {
             .apply_schema_update(
                 &Collection::from((db, collection)),
                 SchemaUpdate::CreateIndex((
-                    String::from(name),
+                    Box::from(name),
                     IndexDef {
                         fields: fields.clone(),
                         ready: false,
