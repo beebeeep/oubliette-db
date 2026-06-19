@@ -16,12 +16,13 @@ use crate::{
     worker,
 };
 use foundationdb::{
-    Transaction,
+    RangeOption, Transaction,
     options::MutationType,
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
+use tracing::debug;
 
 pub(crate) struct DB {
     fdb: foundationdb::Database,
@@ -128,7 +129,16 @@ impl DB {
         }
 
         let versiontstamp = tx.get_versionstamp();
-        let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
+        let _ = tx
+            .commit()
+            .await
+            .context(error::FdbTransactionCommit)
+            .inspect_err(|e| {
+                tracing::error!(
+                    err = ?e,
+                    "document insert failed to commit transaction"
+                )
+            })?;
         let versionstamp = versiontstamp.await.context(error::Fdb {
             e: "getting versionstamp",
         })?;
@@ -139,6 +149,35 @@ impl DB {
         doc.id.versionstamp = Versionstamp::complete(versionstamp, 0);
 
         Ok(doc.id)
+    }
+    pub(crate) async fn dump_index(
+        &self,
+        db: &str,
+        collection: &str,
+        index: &str,
+    ) -> Result<String, AppError> {
+        // let collection = Collection::from((db, collection));
+        let tx = self.fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let mut dump = String::new();
+
+        {
+            // let range = RangeOption::from(&collection.index_subspace(index));
+            let range = RangeOption::from(&Subspace::all().subspace(&(SPACE_DATA, db, collection)));
+            let mut results = tx.get_ranges_keyvalues(range, false);
+            while let Some(kv) = results.next().await {
+                let kv = kv.context(error::Fdb { e: "dumping index" })?;
+                let e: Vec<tuple::Element> =
+                    tuple::unpack(kv.key()).context(error::FdbTupleUnpack)?;
+                eprintln!("{e:?}");
+                dump.push_str(&format!("fdb entry: {:?}\n", e));
+            }
+        }
+
+        let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
+
+        Ok(dump)
     }
 
     fn write_indexes(
@@ -162,7 +201,12 @@ impl DB {
             let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
-            let key = subspace.pack(&doc.id);
+            eprintln!("updating index {index} subspace {subspace:?}");
+            let key = if doc.id.versionstamp.is_complete() {
+                subspace.pack(&doc.id)
+            } else {
+                subspace.pack_with_versionstamp(&doc.id)
+            };
             tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
         }
         Ok(())
@@ -181,6 +225,10 @@ impl DB {
             let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
+            eprintln!(
+                "deleting index {index} subspace {subspace:?} value {:?}",
+                doc.value
+            );
             let key = subspace.pack(&doc.id);
             tx.clear(&key);
         }
@@ -384,6 +432,17 @@ impl DB {
         fields: Vec<IndexField>,
     ) -> Result<(), AppError> {
         let mut schema = self.schema.write().await;
+        for field in &fields {
+            if !field.0.starts_with(".") {
+                error::BadRequest {
+                    e: format!(
+                        "invalid field name '{}', field name must start from dot, e.g. .foo",
+                        field.0
+                    ),
+                }
+                .fail()?;
+            }
+        }
         schema
             .apply_schema_update(
                 &Collection::from((db, collection)),

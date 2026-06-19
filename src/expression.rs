@@ -340,28 +340,34 @@ impl Update {
         &'a self,
         schema: &'a CollectionSchema,
     ) -> Vec<Box<str>> {
-        let mut r = HashSet::new();
+        let mut indexes = HashSet::new();
+        let mut fields = HashSet::new();
         for u in &self.0 {
             match u {
                 AtomicUpdate::Set(fld, _) => {
-                    r.insert(fld.clone());
+                    fields.insert(fld);
                 }
                 AtomicUpdate::Add(fld, _) => {
-                    r.insert(fld.clone());
+                    fields.insert(fld);
                 }
                 AtomicUpdate::Delete(fld) => {
-                    r.insert(fld.clone());
+                    fields.insert(fld);
                 }
                 AtomicUpdate::Drop() => {
-                    for (_, def) in &schema.indexes {
-                        for (fld, _) in &def.fields {
-                            r.insert(fld.clone());
-                        }
+                    for (idx, _) in &schema.indexes {
+                        indexes.insert(idx.clone());
                     }
                 }
             }
         }
-        r.into_iter().collect()
+        for fld in fields {
+            for (idx, def) in &schema.indexes {
+                if def.fields.iter().any(|v| v.0 == *fld) {
+                    indexes.insert(idx.clone());
+                }
+            }
+        }
+        indexes.into_iter().collect()
     }
 }
 
