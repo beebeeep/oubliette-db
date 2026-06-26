@@ -187,7 +187,7 @@ impl<'a> IxScan<'a> {
                         .fail();
                     }
                 };
-                return Ok(Self { collection, range });
+                Ok(Self { collection, range })
             }
             (
                 Some(Sexpr::Symbol(intvl_op)),
@@ -244,15 +244,13 @@ impl<'a> IxScan<'a> {
                         .fail();
                     }
                 };
-                return Ok(Self { collection, range });
+                Ok(Self { collection, range })
             }
-            _ => {
-                return error::BadRequest {
-                    e: format!("invalid ixscan for index {idx_name}"),
-                }
-                .fail();
+            _ => error::BadRequest {
+                e: format!("invalid ixscan for index {idx_name}"),
             }
-        };
+            .fail(),
+        }
     }
 
     fn execute(&self, tx: &'a Transaction) -> impl Stream<Item = Result<Document, AppError>> {
@@ -325,31 +323,31 @@ impl<'a> Plan<'a> {
         collection: &'a Collection,
         schema: &CollectionSchema,
     ) -> Result<Self, AppError> {
-        match list.get(0) {
+        match list.first() {
             Some(Sexpr::Symbol(op)) => match *op {
                 "get_id" => {
-                    assert_len(&list, 2)?;
+                    assert_len(list, 2)?;
                     Ok(Self::PkScan(PkScan::from_expr(&list[1], collection)?))
                 }
                 "ixscan" => {
-                    assert_len(&list, 2)?;
+                    assert_len(list, 2)?;
                     Ok(Self::IxScan(IxScan::from_expr(
                         &list[1], collection, schema,
                     )?))
                 }
                 "scan" => {
-                    assert_len(&list, 2)?;
+                    assert_len(list, 2)?;
                     Ok(Self::Fullscan(Fullscan::from_expr(&list[1], collection)?))
                 }
                 "filter" => {
-                    assert_len(&list, 3)?;
+                    assert_len(list, 3)?;
                     Ok(Self::Filter(Filter {
                         driver: Box::new(Self::from_expr(&list[1], collection, schema)?),
                         expr: Predicate::try_from(&list[2])?,
                     }))
                 }
                 "union" => {
-                    assert_longer(&list, 2)?;
+                    assert_longer(list, 2)?;
                     let mut es = Vec::with_capacity(list.len() - 1);
                     for e in list.iter().skip(1) {
                         es.push(Self::from_expr(e, collection, schema)?);

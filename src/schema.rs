@@ -16,11 +16,11 @@ use crate::{
     "d".db.collection."ix".name.f1.f2.<...>.fn.<doc_id> -> null                                            | secondary index over fields f1, f2, ... fn
     "m"."schema" -> [encoded InstanceSchema]                                                               | instance schema
 */
-pub(crate) const SPACE_DATA: &'static str = "d";
-pub(crate) const SPACE_META: &'static str = "m";
-pub(crate) const KEY_PK: &'static str = "pk";
-pub(crate) const KEY_INDEX: &'static str = "ix";
-pub(crate) const KEY_SCHEMA: &'static str = "schema";
+pub(crate) const SPACE_DATA: &str = "d";
+pub(crate) const SPACE_META: &str = "m";
+pub(crate) const KEY_PK: &str = "pk";
+pub(crate) const KEY_INDEX: &str = "ix";
+pub(crate) const KEY_SCHEMA: &str = "schema";
 
 static FLD_NAME_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"^[a-zA-Z][-_0-9a-zA-Z]*$").unwrap());
@@ -91,14 +91,10 @@ impl IndexDef {
     /// To get index key, pack document ID into resulted subspace.
     pub(crate) fn subspace(&self, mut subspace: Subspace, doc: &Value) -> Option<Subspace> {
         for field in self.fields.iter() {
-            let Some(value) = doc.extract_field(&field.0) else {
-                return None;
-            };
+            let value = doc.extract_field(&field.0)?;
             subspace = match (value, field.1) {
                 (Value(rmpv::Value::String(s)), Some(prefix)) => {
-                    let Some(s) = s.as_str() else {
-                        return None;
-                    };
+                    let s = s.as_str()?;
                     let s = &s[..s.floor_char_boundary(prefix)];
                     subspace.subspace(&s)
                 }

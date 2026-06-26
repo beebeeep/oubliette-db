@@ -1,15 +1,14 @@
-use std::{collections::HashSet, ops::Add};
+use std::collections::HashSet;
 
 use crate::{
     document::Document,
     error::{self, AppError},
     misc::{assert_len, assert_longer},
     schema::CollectionSchema,
-    values::{self, Value},
+    values::Value,
 };
 use sexpression::Expression as Sexpr;
 use snafu::ResultExt;
-use tracing::instrument::WithSubscriber;
 
 pub(crate) struct Update(Vec<AtomicUpdate>);
 enum AtomicUpdate {
@@ -144,10 +143,10 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
             }
             .fail()?
         };
-        match list.get(0) {
+        match list.first() {
             Some(Sexpr::Symbol(op)) => match *op {
                 "and" => {
-                    assert_longer(&list, 2)?;
+                    assert_longer(list, 2)?;
                     let mut v = Vec::with_capacity(list.len() - 1);
                     for e in list.iter().skip(1) {
                         v.push(Self::try_from(e)?);
@@ -155,7 +154,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     Ok(Self::And(v))
                 }
                 "or" => {
-                    assert_longer(&list, 2)?;
+                    assert_longer(list, 2)?;
                     let mut v = Vec::with_capacity(list.len() - 1);
                     for e in list.iter().skip(1) {
                         v.push(Self::try_from(e)?);
@@ -163,11 +162,11 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     Ok(Self::Or(v))
                 }
                 "not" => {
-                    assert_len(&list, 2)?;
+                    assert_len(list, 2)?;
                     Ok(Self::Not(Box::new(Self::try_from(&list[1])?)))
                 }
                 "eq" => {
-                    assert_len(&list, 3)?;
+                    assert_len(list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(AtomicPredicate {
@@ -177,7 +176,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     }))
                 }
                 "gt" => {
-                    assert_len(&list, 3)?;
+                    assert_len(list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(AtomicPredicate {
@@ -187,7 +186,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     }))
                 }
                 "ge" => {
-                    assert_len(&list, 3)?;
+                    assert_len(list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(AtomicPredicate {
@@ -197,7 +196,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     }))
                 }
                 "lt" => {
-                    assert_len(&list, 3)?;
+                    assert_len(list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(AtomicPredicate {
@@ -207,7 +206,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     }))
                 }
                 "le" => {
-                    assert_len(&list, 3)?;
+                    assert_len(list, 3)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let arg = Self::extract_constant(&list[2])?;
                     Ok(Self::Atomic(AtomicPredicate {
@@ -217,7 +216,7 @@ impl TryFrom<&sexpression::Expression<'_>> for Predicate {
                     }))
                 }
                 "in" => {
-                    assert_longer(&list, 2)?;
+                    assert_longer(list, 2)?;
                     let fld = Self::extract_field_ref(&list[1])?;
                     let mut arg = Vec::with_capacity(list.len() - 2);
                     for v in list.iter().skip(2) {
@@ -354,7 +353,7 @@ impl Update {
                     fields.insert(fld);
                 }
                 AtomicUpdate::Drop() => {
-                    for (idx, _) in &schema.indexes {
+                    for idx in schema.indexes.keys() {
                         indexes.insert(idx.clone());
                     }
                 }
@@ -375,11 +374,11 @@ impl AtomicUpdate {
     fn apply(&self, doc: &mut Document) -> Result<bool, AppError> {
         match self {
             AtomicUpdate::Set(fld, value) => {
-                doc.value.update_field(&fld, |_| Ok(Some(value.clone())))?;
+                doc.value.update_field(fld, |_| Ok(Some(value.clone())))?;
                 Ok(false)
             }
             AtomicUpdate::Add(fld, value) => {
-                doc.value.update_field(&fld, |v| {
+                doc.value.update_field(fld, |v| {
                     if let Some(v) = v {
                         *v += value.clone();
                     }
@@ -388,7 +387,7 @@ impl AtomicUpdate {
                 Ok(false)
             }
             AtomicUpdate::Delete(fld) => {
-                doc.value.delete_field(&fld)?;
+                doc.value.delete_field(fld)?;
                 Ok(false)
             }
             AtomicUpdate::Drop() => Ok(true),

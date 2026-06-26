@@ -66,10 +66,10 @@ impl Worker {
                 if index_def.ready {
                     continue;
                 }
-                if let Some(ts) = index_def.lock_timestamp {
-                    if current_ts.saturating_sub(ts) < INDEXER_TIMEOUT {
-                        continue;
-                    }
+                if let Some(ts) = index_def.lock_timestamp
+                    && current_ts.saturating_sub(ts) < INDEXER_TIMEOUT
+                {
+                    continue;
                 }
                 let coll = collection.clone();
                 let db_path = self.db_path.clone();
@@ -173,7 +173,7 @@ async fn materialize_index_batch(
         })?;
         'VALUES: for value in values.iter() {
             let doc = Document::try_from(value)?;
-            let index_ss = collection.index_subspace(&index_name);
+            let index_ss = collection.index_subspace(index_name);
 
             let Some(subspace) = index_def.subspace(index_ss, &doc.value) else {
                 continue 'VALUES;

@@ -56,7 +56,7 @@ impl Value {
                     }
                     _ => {
                         return error::BadRequest {
-                            e: format!("cannot parse value"),
+                            e: "cannot parse value".to_string(),
                         }
                         .fail();
                     }
@@ -99,10 +99,10 @@ impl Value {
     fn extract_field_entry<'a>(&'a self, entry: &str) -> Option<&'a Self> {
         if let rmpv::Value::Map(items) = &self.0 {
             for (k, v) in items {
-                if let Some(s) = k.as_str() {
-                    if s == entry {
-                        return Some(Self::from_ref(v));
-                    }
+                if let Some(s) = k.as_str()
+                    && s == entry
+                {
+                    return Some(Self::from_ref(v));
                 }
             }
         }
@@ -207,7 +207,7 @@ impl PartialEq for Value {
             (rmpv::Value::F64(a), rmpv::Value::Integer(b)) => eq_f64(*a, b),
             (rmpv::Value::Integer(a), rmpv::Value::F32(b)) => eq_f64(*b as f64, a),
             (rmpv::Value::Integer(a), rmpv::Value::F64(b)) => eq_f64(*b, a),
-            (a, b) => a.eq(&b),
+            (a, b) => a.eq(b),
         }
     }
 }
@@ -335,10 +335,9 @@ impl foundationdb::tuple::TuplePack for Value {
                 if let Some(n) = n.as_u64() {
                     n.pack(w, tuple_depth)
                 } else {
-                    return n
-                        .as_i64()
+                    n.as_i64()
                         .ok_or(std::io::Error::from(std::io::ErrorKind::InvalidData))?
-                        .pack(w, tuple_depth);
+                        .pack(w, tuple_depth)
                 }
             }
             rmpv::Value::F32(f) => f.pack(w, tuple_depth),
@@ -359,9 +358,7 @@ pub(crate) fn json2mp(v: serde_json::Value) -> rmpv::Value {
         serde_json::Value::Bool(b) => rmpv::Value::Boolean(b),
         serde_json::Value::Number(n) => j_number2mp(n),
         serde_json::Value::String(s) => j_string2mp(s),
-        serde_json::Value::Array(arr) => {
-            rmpv::Value::Array(arr.into_iter().map(|e| json2mp(e)).collect())
-        }
+        serde_json::Value::Array(arr) => rmpv::Value::Array(arr.into_iter().map(json2mp).collect()),
         serde_json::Value::Object(map) => rmpv::Value::Map(
             map.into_iter()
                 .map(|(k, obj)| (rmpv::Value::String(rmpv::Utf8String::from(k)), json2mp(obj)))
@@ -383,7 +380,7 @@ pub(crate) fn mp2json(v: rmpv::Value) -> serde_json::Value {
         }
         rmpv::Value::Binary(items) => serde_json::Value::String(BASE64_STANDARD.encode(items)),
         rmpv::Value::Array(values) => {
-            serde_json::Value::Array(values.into_iter().map(|e| mp2json(e)).collect())
+            serde_json::Value::Array(values.into_iter().map(mp2json).collect())
         }
         rmpv::Value::Map(items) => mp_map2json(items),
         rmpv::Value::Ext(_, _) => serde_json::Value::Null, // not supported
@@ -435,10 +432,7 @@ fn mp_int2json(v: rmpv::Integer) -> serde_json::Value {
 }
 
 fn eq_f64(f: f64, i: &rmpv::Integer) -> bool {
-    match cmp_f64(f, i) {
-        Some(Ordering::Equal) => true,
-        _ => false,
-    }
+    matches!(cmp_f64(f, i), Some(Ordering::Equal))
 }
 
 fn cmp_f64(f: f64, i: &rmpv::Integer) -> Option<Ordering> {

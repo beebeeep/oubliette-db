@@ -176,7 +176,7 @@ async fn collection_set(
     Path((db, collection)): Path<(String, String)>,
     Json(req): Json<SetRequest>,
 ) -> Result<impl IntoResponse, AppError> {
-    let docs: Vec<rmpv::Value> = req.docs.into_iter().map(|v| json2mp(v)).collect();
+    let docs: Vec<rmpv::Value> = req.docs.into_iter().map(json2mp).collect();
     let mut ids = Vec::with_capacity(docs.len());
     for doc in docs {
         ids.push(state.db.insert_doc(&db, &collection, doc.into()).await?);
@@ -218,7 +218,7 @@ async fn dump_index(
     State(state): State<Arc<AppState>>,
     Path((db, collection)): Path<(String, String)>,
 ) -> Result<String, AppError> {
-    Ok(state.db.dump_index(&db, &collection).await?)
+    state.db.dump_index(&db, &collection).await
 }
 
 async fn collection_update(

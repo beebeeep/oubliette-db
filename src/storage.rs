@@ -1,7 +1,4 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     document::{DocID, Document},
@@ -10,7 +7,7 @@ use crate::{
     planner::Plan,
     schema::{
         Collection, CollectionSchema, IndexDef, IndexField, InstanceSchema, KEY_PK, SPACE_DATA,
-        SchemaUpdate, SchemaVersion,
+        SchemaUpdate,
     },
     values::Value,
     worker,
@@ -22,7 +19,6 @@ use foundationdb::{
 };
 use futures::StreamExt;
 use snafu::ResultExt;
-use tracing::debug;
 
 pub(crate) struct DB {
     fdb: foundationdb::Database,
@@ -182,7 +178,7 @@ impl DB {
         doc: &Document,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
-            let idx_subspace = collection.index_subspace(&index);
+            let idx_subspace = collection.index_subspace(index);
             let index_def = indexes.get(index).expect("index should exist");
             // for (field, _prefix_len) in &index_def.fields {
             //     let Some(value) = doc.extract_field(&field) else {
@@ -195,7 +191,6 @@ impl DB {
             let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
-            eprintln!("updating index {index} subspace {subspace:?}");
             if doc.id.versionstamp.is_complete() {
                 tx.set(&subspace.pack(&doc.id), &[]);
             } else {
@@ -209,7 +204,7 @@ impl DB {
         Ok(())
     }
 
-    fn delete_indexes<'a>(
+    fn delete_indexes(
         tx: &foundationdb::Transaction,
         collection: &Collection,
         indexes: &HashMap<Box<str>, IndexDef>,
@@ -217,15 +212,11 @@ impl DB {
         doc: &Document,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
-            let idx_subspace = collection.index_subspace(&index);
+            let idx_subspace = collection.index_subspace(index);
             let index_def = indexes.get(index).expect("index should exist");
             let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
-            eprintln!(
-                "deleting index {index} subspace {subspace:?} value {:?}",
-                doc.value
-            );
             let key = subspace.pack(&doc.id);
             tx.clear(&key);
         }
@@ -327,7 +318,7 @@ impl DB {
                 let drop = update.apply(&mut doc)?;
                 let key = collection_subspace.pack(&(KEY_PK, &doc.id.schema, &doc.id.versionstamp));
                 if drop {
-                    self.drop_document(&schema, &collection, &key, &doc, &tx);
+                    tx.clear(&key);
                     continue;
                 }
                 let validation_result = schema.validate_doc(&collection, &doc.value)?;
@@ -460,31 +451,6 @@ impl DB {
             )
             .await?;
         Ok(())
-    }
-
-    fn drop_document(
-        &self,
-        schema: &InstanceSchema,
-        collection: &Collection,
-        key: &[u8],
-        doc: &Document,
-        tx: &Transaction,
-    ) {
-        tx.clear(key);
-        /*
-        let Some(col_schema) = schema.collections.get(collection) else {
-            return;
-        };
-        for (idx_name, idx) in &col_schema.indexes {
-            let mut subspace = collection.index_subspace(&idx_name);
-            for (field, _size) in &idx.fields {
-                let Some(value) = doc.value.extract_field(field) else {
-                    continue;
-                };
-                subspace = subspace.subspace(value);
-            }
-        }
-        */
     }
 }
 

@@ -92,7 +92,7 @@ impl IntoResponse for AppError {
                 Json(json!({"error":
                     match source {
                         Some(e) => format!("{message}: {e}"),
-                        None =>    format!("{message}"),
+                        None =>    message.to_string(),
                 }})),
             )
                 .into_response(),
