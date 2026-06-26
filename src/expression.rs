@@ -1,4 +1,4 @@
-use std::ops::Add;
+use std::{collections::HashSet, ops::Add};
 
 use crate::{
     document::Document,
@@ -336,23 +336,38 @@ impl Update {
         Ok(drop)
     }
 
-    pub(crate) fn get_affected_indexes<'a>(&'a self, schema: &'a CollectionSchema) -> Vec<&'a str> {
-        let mut r = Vec::new();
+    pub(crate) fn get_affected_indexes<'a>(
+        &'a self,
+        schema: &'a CollectionSchema,
+    ) -> Vec<Box<str>> {
+        let mut indexes = HashSet::new();
+        let mut fields = HashSet::new();
         for u in &self.0 {
             match u {
-                AtomicUpdate::Set(fld, _) => r.push(fld.as_ref()),
-                AtomicUpdate::Add(fld, _) => r.push(fld.as_ref()),
-                AtomicUpdate::Delete(fld) => r.push(fld.as_ref()),
+                AtomicUpdate::Set(fld, _) => {
+                    fields.insert(fld);
+                }
+                AtomicUpdate::Add(fld, _) => {
+                    fields.insert(fld);
+                }
+                AtomicUpdate::Delete(fld) => {
+                    fields.insert(fld);
+                }
                 AtomicUpdate::Drop() => {
-                    for (_, def) in &schema.indexes {
-                        for (fld, _) in &def.fields {
-                            r.push(fld.as_str());
-                        }
+                    for (idx, _) in &schema.indexes {
+                        indexes.insert(idx.clone());
                     }
                 }
             }
         }
-        r
+        for fld in fields {
+            for (idx, def) in &schema.indexes {
+                if def.fields.iter().any(|v| v.0 == *fld) {
+                    indexes.insert(idx.clone());
+                }
+            }
+        }
+        indexes.into_iter().collect()
     }
 }
 

@@ -176,7 +176,8 @@ impl<'a> IxScan<'a> {
                     },
                     "lt" => RangeOption {
                         begin: KeySelector::first_greater_than(idx_space_begin),
-                        end: KeySelector::last_less_than(last),
+                        // end: KeySelector::last_less_than(last),
+                        end: KeySelector::first_greater_or_equal(first), //??????
                         ..Default::default()
                     },
                     v => {
@@ -388,32 +389,6 @@ impl<'a> Plan<'a> {
             Plan::Fullscan(fullscan) => fullscan.execute(tx).boxed(),
             Plan::PkScan(pkscan) => pkscan.execute(tx).boxed(),
             Plan::IxScan(idx_scan) => idx_scan.execute(tx).boxed(),
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::schema::Collection;
-
-    #[test]
-    fn test_unpack() {
-        let coll = Collection {
-            db: Box::from("testdb"),
-            collection: Box::from("testcol"),
-        };
-
-        let subspace = coll
-            .index_subspace("testindex")
-            .subspace(&1u32)
-            .subspace(&2u32)
-            .subspace(&3u32)
-            .subspace(&4u32);
-        let key = subspace.pack(&"foo");
-        let tp: Vec<foundationdb::tuple::Element> = subspace.unpack(&key).unwrap();
-        match tp.last().unwrap() {
-            foundationdb::tuple::Element::String(cow) => assert_eq!(cow, "fo11o"),
-            _ => panic!("aaa"),
         }
     }
 }

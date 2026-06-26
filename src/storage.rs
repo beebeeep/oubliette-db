@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     document::{DocID, Document},
@@ -13,12 +16,13 @@ use crate::{
     worker,
 };
 use foundationdb::{
-    Transaction,
+    RangeOption, Transaction,
     options::MutationType,
     tuple::{self, Subspace, Versionstamp},
 };
 use futures::StreamExt;
 use snafu::ResultExt;
+use tracing::debug;
 
 pub(crate) struct DB {
     fdb: foundationdb::Database,
@@ -108,29 +112,33 @@ impl DB {
             e: "starting transaction",
         })?;
 
-        let key = collection
-            .pk_subspace()
-            .pack_with_versionstamp(&DocID::incomplete(schema.version));
+        let mut doc = Document {
+            id: DocID::incomplete(schema.version),
+            value: doc,
+        };
+        let key = collection.pk_subspace().pack_with_versionstamp(&doc.id);
 
         let mut payload = Vec::with_capacity(64);
-        rmpv::encode::write_value(&mut payload, &doc.0).context(error::MPVEncode {
+        rmpv::encode::write_value(&mut payload, &doc.value.0).context(error::MPVEncode {
             e: "encoding document",
         })?;
         tx.atomic_op(&key, &payload, MutationType::SetVersionstampedKey);
 
         if let Some(affected_indexes) = validation_result.affected_indexes {
-            Self::write_indexes(
-                &tx,
-                schema.version,
-                &collection,
-                indexes,
-                &affected_indexes,
-                &doc,
-            )?;
+            Self::write_indexes(&tx, &collection, indexes, &affected_indexes, &doc)?;
         }
 
         let versiontstamp = tx.get_versionstamp();
-        let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
+        let _ = tx
+            .commit()
+            .await
+            .context(error::FdbTransactionCommit)
+            .inspect_err(|e| {
+                tracing::error!(
+                    err = ?e,
+                    "document insert failed to commit transaction"
+                )
+            })?;
         let versionstamp = versiontstamp.await.context(error::Fdb {
             e: "getting versionstamp",
         })?;
@@ -138,18 +146,40 @@ impl DB {
             .as_ref()
             .try_into()
             .whatever_context("invalid versionstamp")?;
-        let versionstamp = Versionstamp::complete(versionstamp, 0);
+        doc.id.versionstamp = Versionstamp::complete(versionstamp, 0);
 
-        Ok(DocID::new(schema.version, versionstamp))
+        Ok(doc.id)
+    }
+    pub(crate) async fn dump_index(&self, db: &str, collection: &str) -> Result<String, AppError> {
+        // let collection = Collection::from((db, collection));
+        let tx = self.fdb.create_trx().context(error::Fdb {
+            e: "starting transaction",
+        })?;
+        let mut dump = String::new();
+
+        {
+            // let range = RangeOption::from(&collection.index_subspace(index));
+            let range = RangeOption::from(&Subspace::all().subspace(&(SPACE_DATA, db, collection)));
+            let mut results = tx.get_ranges_keyvalues(range, false);
+            while let Some(kv) = results.next().await {
+                let kv = kv.context(error::Fdb { e: "dumping index" })?;
+                let e: Vec<tuple::Element> =
+                    tuple::unpack(kv.key()).context(error::FdbTupleUnpack)?;
+                dump.push_str(&format!("fdb entry: {:?}\n", e));
+            }
+        }
+
+        let _ = tx.commit().await.context(error::FdbTransactionCommit)?;
+
+        Ok(dump)
     }
 
     fn write_indexes(
         tx: &foundationdb::Transaction,
-        schema_version: SchemaVersion,
         collection: &Collection,
         indexes: &HashMap<Box<str>, IndexDef>,
         affected_indexes: &[Box<str>],
-        doc: &Value,
+        doc: &Document,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
             let idx_subspace = collection.index_subspace(&index);
@@ -162,33 +192,42 @@ impl DB {
             //     idx_subspace = idx_subspace.subspace(value); // NOTE: this may panic if value is bad (like invalid UTF-8 for strings) or unsupported
             // }
             // let key = idx_subspace.pack_with_versionstamp(&DocID::incomplete(schema_version));
-            let Some(subspace) = index_def.subspace(idx_subspace, doc) else {
+            let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
-            let key = subspace.pack(&DocID::incomplete(schema_version));
-            tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
+            eprintln!("updating index {index} subspace {subspace:?}");
+            if doc.id.versionstamp.is_complete() {
+                tx.set(&subspace.pack(&doc.id), &[]);
+            } else {
+                tx.atomic_op(
+                    &subspace.pack_with_versionstamp(&doc.id),
+                    &[],
+                    MutationType::SetVersionstampedKey,
+                );
+            };
         }
         Ok(())
     }
 
-    fn update_indexes<'a>(
+    fn delete_indexes<'a>(
         tx: &foundationdb::Transaction,
         collection: &Collection,
         indexes: &HashMap<Box<str>, IndexDef>,
-        affected_indexes: &[&str],
+        affected_indexes: &[Box<str>],
         doc: &Document,
-        drop: bool,
     ) -> Result<(), AppError> {
         'NEXT_INDEX: for index in affected_indexes {
             let idx_subspace = collection.index_subspace(&index);
-            let index_def = indexes.get(*index).expect("index should exist");
+            let index_def = indexes.get(index).expect("index should exist");
             let Some(subspace) = index_def.subspace(idx_subspace, &doc.value) else {
                 continue 'NEXT_INDEX;
             };
+            eprintln!(
+                "deleting index {index} subspace {subspace:?} value {:?}",
+                doc.value
+            );
             let key = subspace.pack(&doc.id);
-            if drop {
-                tx.clear(&key);
-            }
+            tx.clear(&key);
         }
         Ok(())
     }
@@ -268,21 +307,23 @@ impl DB {
             e: "starting transaction",
         })?;
         {
-            // execute the query, iterate over its results, apply update and insert updated document back
+            // execute the query, iterate over its results, for each result:
+            // 1. Delete existing indexes referring to that record, if any
+            // 2. Apply update to the document
+            // 3. Insert updated document back (under same ID)
+            // 4. Write updated indexes
             let mut result = plan.execute(&tx);
             let affected_indexes = update.get_affected_indexes(coll_schema);
             while let Some(doc) = result.next().await {
                 affected += 1;
                 let mut doc = doc?;
-                // TODO: update shall update index too!
-                Self::update_indexes(
+                Self::delete_indexes(
                     &tx,
                     &collection,
                     &coll_schema.indexes,
                     &affected_indexes,
                     &doc,
-                    false,
-                );
+                )?;
                 let drop = update.apply(&mut doc)?;
                 let key = collection_subspace.pack(&(KEY_PK, &doc.id.schema, &doc.id.versionstamp));
                 if drop {
@@ -296,6 +337,13 @@ impl DB {
                     }
                     .fail()?;
                 }
+                Self::write_indexes(
+                    &tx,
+                    &collection,
+                    &coll_schema.indexes,
+                    &affected_indexes,
+                    &doc,
+                )?;
                 let mut payload = Vec::with_capacity(64);
                 rmpv::encode::write_value(&mut payload, &doc.value.0).context(
                     error::MPVEncode {
@@ -385,11 +433,22 @@ impl DB {
         fields: Vec<IndexField>,
     ) -> Result<(), AppError> {
         let mut schema = self.schema.write().await;
+        for field in &fields {
+            if !field.0.starts_with(".") {
+                error::BadRequest {
+                    e: format!(
+                        "invalid field name '{}', field name must start from dot, e.g. .foo",
+                        field.0
+                    ),
+                }
+                .fail()?;
+            }
+        }
         schema
             .apply_schema_update(
                 &Collection::from((db, collection)),
                 SchemaUpdate::CreateIndex((
-                    String::from(name),
+                    Box::from(name),
                     IndexDef {
                         fields: fields.clone(),
                         ready: false,

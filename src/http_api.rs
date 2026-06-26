@@ -95,6 +95,7 @@ pub async fn start(db_path: &str) -> Result<(), AppError> {
         .route("/{db}/{collection}", patch(collection_update))
         .route("/_manage/{db}/{collection}/create", post(create_collection))
         .route("/_manage/{db}/{collection}/create_index", post(add_index))
+        .route("/_manage/{db}/{collection}/dump", get(dump_index))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind("localhost:4800")
         .await
@@ -205,13 +206,19 @@ async fn add_index(
     let fields = req
         .fields
         .into_iter()
-        .map(|f| (f.field.into_string(), f.prefix_length))
+        .map(|f| (f.field, f.prefix_length))
         .collect();
     state
         .db
         .create_index(&db, &collection, &req.name, fields)
         .await?;
     Ok(Json(AddIndexResponse {}))
+}
+async fn dump_index(
+    State(state): State<Arc<AppState>>,
+    Path((db, collection)): Path<(String, String)>,
+) -> Result<String, AppError> {
+    Ok(state.db.dump_index(&db, &collection).await?)
 }
 
 async fn collection_update(

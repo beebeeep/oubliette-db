@@ -14,25 +14,28 @@ Experimental document [layer](https://apple.github.io/foundationdb/layer-concept
 ## Usage
 * Create the database and collection:
   ```
-  curl -s -X POST --json '{}' localhost:4800/_manage/testdb/testcollection/create
+  curl -vs -X POST --json '{}' localhost:4800/_manage/testdb/testcollection/create
   ```
 * Insert some documents:
   ```
-  curl -s -X PUT --json '{"docs": [{"foo": "137, "bar": true, "baz": "chlos"}]}' localhost:4800/testdb/testcollection
+  curl -vs -X PUT --json '{"docs": [{"foo": "137, "bar": true, "baz": "chlos"}]}' localhost:4800/testdb/testcollection
   ```
 * Create index:
   ```
-  curl -vks -X POST --json '{"name": "idx_foo", "fields": [{"field": ".foo"}]}' localhost:4800/_manage/testdb/testcollection/create_index
+  curl -vs -X POST --json '{"name": "idx_foo", "fields": [{"field": ".foo"}]}' localhost:4800/_manage/testdb/testcollection/create_index
   ```
 * Retrieve document by ID:
   ```
-  curl -s localhost:4800/testdb/testcollection/04000000000000004e12ca2000000000
+  curl -vs localhost:4800/testdb/testcollection/04000000000000004e12ca2000000000
   ```
 * Query the data:
   ```
   curl -vs -X POST --json '{"plan": "(scan ())"}' localhost:4800/testdb/testcollection
   ```
-
+* Update data:
+  ```
+  curl -vs -X PATCH localhost:4800/testdb/testcollection --json '{"plan": "(scan (eq .foo 137))", "update": "((set .bar \"chlos\"))"}'
+  ```
 
 ## Query planner
 Oubliette leverages classic Volcano iterator model for query execution. In the nutshell, the query execution plan consists of number of operators reading data directly from the database and producing stream of documents. Those streams can be then somehow filtered, joined or combined with each other according to the query plan, thus producing the stream of documents matching the query.
@@ -83,3 +86,19 @@ Example:
     (scan (eq .bar "chlos")))
   (eq .baz.baq 0))
 ```
+
+## Updating documents
+Update request consists of two arguments: `query`, which is a query plan that selects document to update, and `update` which is a list of expressions that updates each matched document.
+Example updates:
+```
+((set .foo 1))    ; set field .foo to 1
+((add .bar 2))    ; add 2 to .bar (also works as concatenation for strings)
+((delete .foo))   ; delete field .foo from document
+((drop))          ; drop whole document
+
+; Note that update actually is a list, you can specify multiple actions: 
+(
+  (set .foo 1)          ; set field .foo to 1
+  (set .bar "chlos"))   ; and set field .bar to "chlos"
+```
+

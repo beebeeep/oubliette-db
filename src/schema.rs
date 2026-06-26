@@ -6,7 +6,6 @@ use snafu::{OptionExt, ResultExt};
 use tracing::info;
 
 use crate::{
-    document::Document,
     error::{self, AppError},
     values::Value,
 };
@@ -47,7 +46,7 @@ pub(crate) struct CollectionSchema {
 }
 
 /// field name and prefix length in bytes (utf-8 strings are truncated to closest char boundary)
-pub(crate) type IndexField = (String, Option<usize>);
+pub(crate) type IndexField = (Box<str>, Option<usize>);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub(crate) struct IndexDef {
@@ -70,7 +69,7 @@ pub(crate) enum DataType {
 
 pub(crate) enum SchemaUpdate {
     UpdateCollection(CollectionSchema),
-    CreateIndex((String, IndexDef)),
+    CreateIndex((Box<str>, IndexDef)),
 }
 
 pub(crate) struct ValidationResult {
@@ -83,7 +82,9 @@ type ReferredFields = Vec<Box<str>>;
 
 impl IndexDef {
     fn contains(&self, field: &str) -> bool {
-        self.fields.iter().any(|(idx_field, _)| idx_field == field)
+        self.fields
+            .iter()
+            .any(|(idx_field, _)| idx_field.as_ref() == field)
     }
 
     /// Constructs index subspace by appending all indexed field values to the root index key.
@@ -211,14 +212,14 @@ impl InstanceSchema {
                         .context(error::BadRequest {
                             e: "collection does not exist",
                         })?;
-                if col.indexes.contains_key(name.as_str()) {
+                if col.indexes.contains_key(&name) {
                     error::BadRequest {
                         e: "index already exists",
                     }
                     .fail()?;
                 }
 
-                col.indexes.insert(name.into_boxed_str(), index);
+                col.indexes.insert(name, index);
             }
         }
 
@@ -409,20 +410,20 @@ mod tests {
                     fields: HashMap::new(),
                     indexes: HashMap::from([
                         (
-                            Box::new("idx_foo"),
+                            Box::from("idx_foo"),
                             IndexDef {
-                                fields: vec![(String::from(".foo"), Some(0))],
+                                fields: vec![(Box::from(".foo"), Some(0))],
                                 ready: true,
                                 lock_timestamp: None,
                                 last_indexed_key: None,
                             },
                         ),
                         (
-                            Box::new("idx_foo_barbaz"),
+                            Box::from("idx_foo_barbaz"),
                             IndexDef {
                                 fields: vec![
-                                    (String::from(".foo"), Some(0)),
-                                    (String::from(".bar.baz"), Some(0)),
+                                    (Box::from(".foo"), Some(0)),
+                                    (Box::from(".bar.baz"), Some(0)),
                                 ],
                                 ready: true,
                                 lock_timestamp: None,
@@ -446,10 +447,7 @@ mod tests {
                 v.sort();
                 v
             }),
-            Some(vec![
-                String::from("idx_foo"),
-                String::from("idx_foo_barbaz")
-            ])
+            Some(vec![Box::from("idx_foo"), Box::from("idx_foo_barbaz")])
         );
 
         assert!(schema.validate_doc(&coll, &j(r#"{"foo": "bar"}"#)).is_err());
@@ -461,10 +459,7 @@ mod tests {
             coll.clone(),
             r.updated_collection.expect("collection update expected"),
         );
-        assert_eq!(
-            r.affected_indexes,
-            Some(vec![String::from("idx_foo_barbaz")])
-        );
+        assert_eq!(r.affected_indexes, Some(vec![Box::from("idx_foo_barbaz")]));
 
         assert!(
             schema
@@ -489,10 +484,7 @@ mod tests {
         assert!(r.updated_collection.is_none());
         assert_eq!(
             r.affected_indexes,
-            Some(vec![
-                String::from("idx_foo_barbaz"),
-                String::from("idx_foo"),
-            ])
+            Some(vec![Box::from("idx_foo_barbaz"), Box::from("idx_foo"),])
         );
 
         let r = schema
