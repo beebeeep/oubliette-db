@@ -176,7 +176,8 @@ impl<'a> IxScan<'a> {
                     },
                     "lt" => RangeOption {
                         begin: KeySelector::first_greater_than(idx_space_begin),
-                        end: KeySelector::last_less_than(last),
+                        // end: KeySelector::last_less_than(last),
+                        end: KeySelector::first_greater_or_equal(first), //??????
                         ..Default::default()
                     },
                     v => {

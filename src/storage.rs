@@ -150,12 +150,7 @@ impl DB {
 
         Ok(doc.id)
     }
-    pub(crate) async fn dump_index(
-        &self,
-        db: &str,
-        collection: &str,
-        index: &str,
-    ) -> Result<String, AppError> {
+    pub(crate) async fn dump_index(&self, db: &str, collection: &str) -> Result<String, AppError> {
         // let collection = Collection::from((db, collection));
         let tx = self.fdb.create_trx().context(error::Fdb {
             e: "starting transaction",
@@ -170,7 +165,6 @@ impl DB {
                 let kv = kv.context(error::Fdb { e: "dumping index" })?;
                 let e: Vec<tuple::Element> =
                     tuple::unpack(kv.key()).context(error::FdbTupleUnpack)?;
-                eprintln!("{e:?}");
                 dump.push_str(&format!("fdb entry: {:?}\n", e));
             }
         }
@@ -202,12 +196,15 @@ impl DB {
                 continue 'NEXT_INDEX;
             };
             eprintln!("updating index {index} subspace {subspace:?}");
-            let key = if doc.id.versionstamp.is_complete() {
-                subspace.pack(&doc.id)
+            if doc.id.versionstamp.is_complete() {
+                tx.set(&subspace.pack(&doc.id), &[]);
             } else {
-                subspace.pack_with_versionstamp(&doc.id)
+                tx.atomic_op(
+                    &subspace.pack_with_versionstamp(&doc.id),
+                    &[],
+                    MutationType::SetVersionstampedKey,
+                );
             };
-            tx.atomic_op(&key, &[], MutationType::SetVersionstampedKey);
         }
         Ok(())
     }
@@ -310,7 +307,11 @@ impl DB {
             e: "starting transaction",
         })?;
         {
-            // execute the query, iterate over its results, apply update and insert updated document back
+            // execute the query, iterate over its results, for each result:
+            // 1. Delete existing indexes referring to that record, if any
+            // 2. Apply update to the document
+            // 3. Insert updated document back (under same ID)
+            // 4. Write updated indexes
             let mut result = plan.execute(&tx);
             let affected_indexes = update.get_affected_indexes(coll_schema);
             while let Some(doc) = result.next().await {
