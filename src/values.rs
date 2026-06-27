@@ -5,7 +5,7 @@ use std::{
 
 use base64::prelude::*;
 use bytemuck::TransparentWrapper;
-use snafu::{OptionExt, ResultExt};
+use snafu::ResultExt;
 
 use crate::error::{self, AppError};
 
@@ -71,16 +71,6 @@ impl Value {
         })
     }
 
-    pub(crate) fn truncate(&mut self, len: usize) -> Result<(), AppError> {
-        if let rmpv::Value::String(us) = &self.0 {
-            let mut s = us.as_str().whatever_context("non UTF-8 string")?;
-            if len < s.len() {
-                s = &s[..s.floor_char_boundary(len)];
-                self.0 = rmpv::Value::from(s);
-            }
-        }
-        Ok(())
-    }
     pub(crate) fn extract_field<'a>(&'a self, path: &str) -> Option<&'a Self> {
         // path looks like .foo.bar.baz, split it by ".", skip 1st part
         // and incrementally dig into the value, expecting that .foo and .foo.bar are objects
