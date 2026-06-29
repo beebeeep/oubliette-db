@@ -33,31 +33,31 @@ pub(crate) struct Collection {
     pub(crate) collection: Box<str>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Default)]
-pub(crate) struct InstanceSchema {
-    pub(crate) version: SchemaVersion,
-    pub(crate) collections: HashMap<Collection, CollectionSchema>,
+#[derive(Serialize, Deserialize, Debug, Default, Clone)]
+pub struct InstanceSchema {
+    pub version: SchemaVersion,
+    pub collections: HashMap<Collection, CollectionSchema>,
 }
 
 #[derive(Clone, Serialize, Deserialize, Default, Debug)]
 pub(crate) struct CollectionSchema {
-    pub(crate) fields: HashMap<Box<str>, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
-    pub(crate) indexes: HashMap<Box<str>, IndexDef>,
+    pub fields: HashMap<Box<str>, DataType>, // name is flattened path to field, e.g ".foo.bar.baz"
+    pub indexes: HashMap<Box<str>, IndexDef>,
 }
 
 /// field name and prefix length in bytes (utf-8 strings are truncated to closest char boundary)
-pub(crate) type IndexField = (Box<str>, Option<usize>);
+pub type IndexField = (Box<str>, Option<usize>);
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub(crate) struct IndexDef {
-    pub(crate) fields: Vec<IndexField>,
-    pub(crate) ready: bool,
+    pub fields: Vec<IndexField>,
+    pub ready: bool,
     pub(crate) lock_timestamp: Option<u128>, // unixtime in ms
     pub(crate) last_indexed_key: Option<Vec<u8>>,
 }
 
 #[derive(Clone, Serialize, Deserialize, PartialEq, Debug)]
-pub(crate) enum DataType {
+pub enum DataType {
     Integer,
     Float,
     String,

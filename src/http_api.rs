@@ -1,7 +1,8 @@
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     error::AppError,
+    schema::InstanceSchema,
     storage,
     values::{json2mp, mp2json},
 };
@@ -76,6 +77,30 @@ pub struct GetDocResponse {
     pub doc: Option<serde_json::Value>,
 }
 
+#[derive(Serialize, Deserialize)]
+pub struct GetSchemaResponse {
+    // pub version: u32,
+    pub schema: InstanceSchema,
+    // pub databases: HashMap<String, DatabaseSchema>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct DatabaseSchema {
+    pub collections: HashMap<String, CollectionSchema>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct CollectionSchema {
+    pub fields: HashMap<String, String>,
+    pub indexes: HashMap<String, IndexSchema>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct IndexSchema {
+    pub fields: Vec<String>,
+    pub indexes: HashMap<String, IndexSchema>,
+}
+
 struct AppState {
     db: storage::DB,
 }
@@ -93,6 +118,7 @@ pub async fn start(db_path: &str) -> Result<(), AppError> {
         .route("/{db}/{collection}", post(collection_query))
         .route("/{db}/{collection}", put(collection_set))
         .route("/{db}/{collection}", patch(collection_update))
+        .route("/_manage/{db}/schema", get(get_schema))
         .route("/_manage/{db}/{collection}/create", post(create_collection))
         .route("/_manage/{db}/{collection}/create_index", post(add_index))
         .route("/_manage/{db}/{collection}/dump", get(dump_index))
@@ -187,6 +213,13 @@ async fn collection_set(
         .map(|id| String::from(&id).into_boxed_str())
         .collect();
     Ok((StatusCode::CREATED, Json(SetResponse { ids })))
+}
+
+async fn get_schema(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<GetSchemaResponse>, AppError> {
+    let schema = state.db.get_schema().await?;
+    Ok(Json(GetSchemaResponse { schema }))
 }
 
 async fn create_collection(

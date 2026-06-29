@@ -399,6 +399,10 @@ impl DB {
         }
     }
 
+    pub(crate) async fn get_schema(&self) -> Result<InstanceSchema, AppError> {
+        Ok(self.schema.read().await.clone())
+    }
+
     pub(crate) async fn create_collection(
         &self,
         db: &str,
